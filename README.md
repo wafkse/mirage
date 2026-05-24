@@ -2,7 +2,7 @@
 
 Mirage is a lightweight, asynchronous background daemon that orchestrates your dotfiles using a single source of truth.
 
-Managing a customized Linux desktop involves juggling overlapping design tokens—colors, fonts, borders, layout gaps—across tools that use entirely different configuration formats. Your terminal might use TOML, your window manager a custom syntax, your status bar JSON, and your app launcher CSS. Trying to keep these in sync usually means writing fragile `sed` scripts or adopting massive framework wrappers like Home Manager.
+Managing a customized Linux desktop involves juggling overlapping design tokens: colors, fonts, borders and layout gaps, across tools that use entirely different configuration formats. Your terminal might use TOML, your window manager a custom syntax, your status bar JSON, and your app launcher CSS. Trying to keep these in sync usually means writing fragile `sed` scripts or adopting massive framework wrappers like Home Manager.
 
 Mirage solves this by completely separating your **data** from your **layout**. You define your variables in central TOML files, write your configurations as Tera templates, and let Mirage hydrate everything on the fly. 
 
@@ -11,8 +11,6 @@ It acts as a reactive state engine for your filesystem.
 ### Extreme Resource Efficiency
 
 Mirage is designed to run continuously as a background process. Written in async Rust, it spends almost its entire lifecycle asleep, blocked on filesystem (`inotify`) and socket (`epoll`) syscalls. This is to make multiple Mirage instances running across the system not take a noticeable amount of memory. 
-
-
 
 ## Core Concepts
 
@@ -28,15 +26,13 @@ Template candidates are the actual configuration files for your applications, wr
 
 Mirage identifies render targets by scanning for any file ending in a `.tera` extension. You write your configuration files exactly as you normally would, injecting Tera variables where needed (e.g., `{{ theme.base_color }}` or `{{ layout.gaps_in }}`).
 
-
-
 ## The Manifest: Bringing It Together
 
 To make Mirage work, you must define a `.mirage.toml` manifest file. This manifest tells the daemon where to find your data, where to output your templates, and how to resolve conflicts between your TOML files.
 
 A typical manifest looks like this:
 
-```/dev/null/.mirage.toml#L1-12
+```
 [configure]
 profile = "default"
 template = "/home/user/.config"
@@ -62,8 +58,6 @@ Mirage utilizes the `figment` configuration library under the hood. When it proc
 * **`fallback`**: The candidate only provides values for keys that have not already been defined by an earlier candidate.
 * **`supplement`**: Similar to fallback, but applies specifically to appending arrays without overriding existing entries.
 
-
-
 ## Profile & Variable Semantics
 
 Inside your TOML configure candidates, variables are organized into tables. Mirage treats these top-level tables as **Profiles**, which allows you to define conditional states (like a "powersave" mode or a "dark" theme) alongside your base configurations.
@@ -82,7 +76,7 @@ When state changes, Mirage executes a strict, transactional pipeline to update y
 
 ### All-or-Nothing Rendering
 To ensure your desktop never ends up in a broken or half-configured state, Mirage treats every state change as a transaction. 
-When a re-render is triggered, Mirage evaluates *all* templates into a temporary directory on the same filesystem mount. If a single template fails to compile—whether due to a syntax error, a missing variable, or an invalid type—the entire hydration pass aborts. Your existing, working configurations are left completely untouched, and the error is logged.
+When a re-render is triggered, Mirage evaluates *all* templates into a temporary directory on the same filesystem mount. If a single template fails to compile, whether due to a syntax error, a missing variable, or an invalid type, the entire hydration pass aborts. Your existing, working configurations are left completely untouched, and the error is logged.
 
 ### In-Place, Atomic Renames
 
@@ -124,3 +118,11 @@ A teeny bit of personal recommendations:
 
 * You should add a negative `.gitignore` line to not include any non-Tera file into the untracked file pool if your dotfiles are being managed via Git: `!*.tera`. This keeps hydrated artifacts out of the repository.
 * Do not edit non-Tera hydrated files directly, any re-hydration will override all your changes. The template dictates all.
+
+# License
+
+Copyright (C) 2026 W. Frakchi
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+See [the full license agreement](./LICENSE) for further information.
