@@ -36,7 +36,7 @@ pub struct ConfigureState {
 impl ConfigureState {
     /// Instantiate a [`ConfigureState`] with the target configure candidate list.
     #[inline]
-    pub fn new(candidate_list: Vec<Candidate>, target_profile: Profile) -> anyhow::Result<Self> {
+    pub fn new(candidate_list: Vec<Candidate>, target_profile: Profile) -> eyre::Result<Self> {
         let configure_watch = {
             let mut configure_watch = FsWatcher::standard()?;
 
@@ -92,7 +92,7 @@ impl ConfigureState {
 impl Oneshot for ConfigureState {
     type Output = ();
 
-    async fn oneshot(&mut self) -> anyhow::Result<Self::Output> {
+    async fn oneshot(&mut self) -> eyre::Result<Self::Output> {
         let Self {
             configure_watch,
             candidate_list,

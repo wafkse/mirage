@@ -4,27 +4,47 @@ use std::ops::{Deref, DerefMut};
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
-use tokio::net::UnixDatagram;
+use tokio::net::{UnixDatagram, unix::SocketAddr};
 
 use crate::oneshot::Oneshot;
 
 /// A control message request.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "lowercase")]
 pub enum ControlRequest {
     /// A ping message.
     Ping,
 
     /// A profile change message.
-    Profile(figment::Profile),
+    Profile {
+        /// The name of the profile to change to.
+        name: figment::Profile,
+    },
+
+    /// A hydrate message.
+    ///
+    /// This forces a full re-hydrate operation.
+    Hydrate,
+
+    /// Merge transient values into the current render context.
+    ///
+    /// Configure context rebuilding replaces these values.
+    Mutate {
+        /// Values to merge into the render context.
+        context: serde_json::Value,
+    },
 }
 
 /// A control message response.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "response", rename_all = "lowercase")]
 pub enum ControlResponse {
     /// A pong message.
     Pong,
 
-    /// Acknowledgement that a control request was accepted.
+    /// An acknowledgement message.
+    ///
+    /// The context update or profile notification was accepted. Rendering proceeds asynchronously.
     Acknowledge,
 }
 
@@ -45,18 +65,19 @@ impl ControlState {
 }
 
 impl Oneshot for ControlState {
-    type Output = ControlRequest;
+    type Output = (SocketAddr, ControlRequest);
 
-    async fn oneshot(&mut self) -> anyhow::Result<Self::Output> {
+    async fn oneshot(&mut self) -> eyre::Result<Self::Output> {
         let Self { control_socket, .. } = self;
 
         let mut control_buffer = BytesMut::new();
 
-        control_socket.recv_buf(&mut control_buffer).await?;
+        let (.., target_address) = control_socket.recv_buf_from(&mut control_buffer).await?;
 
-        Ok(serde_json::from_slice::<ControlRequest>(
-            &control_buffer[..],
-        )?)
+        Ok((
+            target_address,
+            serde_json::from_slice::<ControlRequest>(&control_buffer[..])?,
+        ))
     }
 }
 

@@ -16,13 +16,13 @@ use mirage::server::{Mirage, MirageCli};
 use mirage::oneshot::Oneshot;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> eyre::Result<()> {
     let mut mirage_state = Mirage::new(MirageCli::parse())?;
 
     match mirage_state.oneshot().await {
         Ok(..) => Ok(()),
         Err(target_value) => {
-            eprintln!("{target_value}");
+            eprintln!("{target_value:?}");
 
             let mut target_error = target_value.source();
 

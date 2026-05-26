@@ -20,13 +20,13 @@ pub struct FsWatcher(mpsc::UnboundedReceiver<Event>, RecommendedWatcher);
 impl FsWatcher {
     /// Construct a filesystem watcher using [`notify::Config::default`].
     #[inline]
-    pub fn standard() -> anyhow::Result<Self> {
+    pub fn standard() -> eyre::Result<Self> {
         Self::configured(notify::Config::default())
     }
 
     /// Instantiate a filesystem watcher with the provided configuration.
     #[inline]
-    pub fn configured(target_configure: notify::Config) -> anyhow::Result<Self> {
+    pub fn configured(target_configure: notify::Config) -> eyre::Result<Self> {
         let (channel_send, channel_recv) = mpsc::unbounded_channel();
 
         Ok(Self(
@@ -75,6 +75,9 @@ impl DerefMut for FsWatcher {
 }
 
 /// Forward successful watcher events to the receiving [`FsWatcher`].
+///
+/// Sending an event panics if the receiver has been dropped. Watcher errors are discarded.
+// NOTE(invariant): None.
 #[derive(Debug)]
 struct FsEventForwarder(mpsc::UnboundedSender<Event>);
 
