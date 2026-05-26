@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::anyhow;
+use eyre::eyre;
 use notify::{RecursiveMode, Watcher};
-use tempfile::tempdir_in;
+use tempfile::{TempDir, tempdir_in};
 use tokio::{
     fs::{self},
     sync::watch,
@@ -39,13 +39,13 @@ impl HydrationState {
     pub fn new(
         template_root: impl AsRef<Path>,
         context_pipe: watch::Receiver<tera::Context>,
-    ) -> anyhow::Result<Self> {
+    ) -> eyre::Result<Self> {
         let tera_state = Tera::new(
             template_root
                 .as_ref()
                 .join("**/*.tera")
                 .to_str()
-                .ok_or_else(|| anyhow!("template root is bad utf-8"))?,
+                .ok_or_else(|| eyre!("template root is bad utf-8"))?,
         )?;
 
         let mut watcher_template = FsWatcher::standard()?;
@@ -69,7 +69,7 @@ impl HydrationState {
 impl Oneshot for HydrationState {
     type Output = ();
 
-    async fn oneshot(&mut self) -> anyhow::Result<Self::Output> {
+    async fn oneshot(&mut self) -> eyre::Result<Self::Output> {
         let Self {
             tera_state,
             watcher_template,
@@ -121,49 +121,52 @@ impl Oneshot for HydrationState {
         };
 
         if target_change {
-            let mut change_closure = async || -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
-                // NOTE: Under a compatible circumstance, reload the complete Tera state.
-                Tera::full_reload(tera_state)?;
+            let mut change_closure =
+                async || -> eyre::Result<(TempDir, Vec<(PathBuf, PathBuf)>)> {
+                    // NOTE: Under a compatible circumstance, reload the complete Tera state.
+                    Tera::full_reload(tera_state)?;
 
-                let mut rename_list = Vec::new();
+                    let mut rename_list = Vec::new();
 
-                let temp_filedir = tempdir_in(template_root.as_path())?;
+                    let temp_filedir = tempdir_in(template_root.as_path())?;
 
-                for template_name in tera_state.get_template_names() {
-                    let mut template_path = template_root.join(template_name);
+                    for template_name in tera_state.get_template_names() {
+                        let mut template_path = template_root.join(template_name);
 
-                    let template_perms = fs::metadata(template_path.as_path()).await?.permissions();
+                        let template_perms =
+                            fs::metadata(template_path.as_path()).await?.permissions();
 
-                    let mut temp_path = temp_filedir.path().join(template_name);
+                        let mut temp_path = temp_filedir.path().join(template_name);
 
-                    // NOTE: Remove the `*.tera` extension from both the template and atomic tempfile path.
-                    template_path.set_extension("");
-                    temp_path.set_extension("");
+                        // NOTE: Remove the `*.tera` extension from both the template and atomic tempfile path.
+                        template_path.set_extension("");
+                        temp_path.set_extension("");
 
-                    fs::create_dir_all(
-                        temp_path
-                            .parent()
-                            .ok_or_else(|| anyhow!("tempfile does not have a parent"))?,
-                    )
-                    .await?;
+                        fs::create_dir_all(
+                            temp_path
+                                .parent()
+                                .ok_or_else(|| eyre!("tempfile does not have a parent"))?,
+                        )
+                        .await?;
 
-                    fs::write(
-                        temp_path.as_path(),
-                        Tera::render(tera_state, template_name, &context_pipe.borrow())?.as_bytes(),
-                    )
-                    .await?;
+                        fs::write(
+                            temp_path.as_path(),
+                            Tera::render(tera_state, template_name, &context_pipe.borrow())?
+                                .as_bytes(),
+                        )
+                        .await?;
 
-                    fs::set_permissions(temp_path.as_path(), template_perms).await?;
+                        fs::set_permissions(temp_path.as_path(), template_perms).await?;
 
-                    rename_list.push((temp_path, template_path));
-                }
+                        rename_list.push((temp_path, template_path));
+                    }
 
-                Ok(rename_list)
-            };
+                    Ok((temp_filedir, rename_list))
+                };
 
             let target_value = change_closure().await;
 
-            if let Ok(rename_list) = target_value {
+            if let Ok((.., rename_list)) = target_value {
                 for (from, to) in rename_list {
                     fs::rename(from, to).await?;
                 }

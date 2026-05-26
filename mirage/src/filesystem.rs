@@ -17,13 +17,13 @@ impl FsWatcher {
     ///
     /// This is identical to `FsWatcher::configured(Config::default())`.
     #[inline]
-    pub fn standard() -> anyhow::Result<Self> {
+    pub fn standard() -> eyre::Result<Self> {
         Self::configured(notify::Config::default())
     }
 
     /// Instantiate a filesystem watcher with the provided configuration.
     #[inline]
-    pub fn configured(target_configure: notify::Config) -> anyhow::Result<Self> {
+    pub fn configured(target_configure: notify::Config) -> eyre::Result<Self> {
         let (channel_send, channel_recv) = mpsc::unbounded_channel();
 
         Ok(Self(
@@ -71,7 +71,7 @@ impl DerefMut for FsWatcher {
     }
 }
 
-/// A filesystem watch event forwarded, provided to a `notify::RecommendedWatcher` as the [`EventHandler`].
+/// A filesystem watch event forwarder, provided to a `notify::RecommendedWatcher` as the [`EventHandler`].
 ///
 /// This sends to the other end of the pipe to a [`FsWatcher`].
 #[derive(Debug)]

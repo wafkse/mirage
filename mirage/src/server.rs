@@ -2,8 +2,9 @@
 
 use std::{env, net::Shutdown, path::PathBuf};
 
-use anyhow::anyhow;
 use clap::Parser;
+
+use eyre::eyre;
 
 use figment::{
     Figment, Profile,
@@ -15,7 +16,11 @@ use tokio::{fs, net::UnixDatagram, signal};
 use crate::{
     manifest::{Manifest, ManifestCandidate, ManifestConfigure},
     oneshot::Oneshot,
-    state::{configure::ConfigureState, control::ControlState, hydrate::HydrationState},
+    state::{
+        configure::ConfigureState,
+        control::{ControlRequest, ControlResponse, ControlState},
+        hydrate::HydrationState,
+    },
 };
 
 /// The Mirage command-line daemon.
@@ -66,7 +71,7 @@ impl Mirage {
 
     /// Construct a new daemon state from the target settings.
     #[inline]
-    pub fn new(target_settings: MirageCli) -> anyhow::Result<Self> {
+    pub fn new(target_settings: MirageCli) -> eyre::Result<Self> {
         let MirageCli {
             configure: command_configure,
             profile: command_profile,
@@ -93,7 +98,7 @@ impl Mirage {
         let template_root = command_template
             .as_ref()
             .or(manifest_template.as_ref())
-            .ok_or_else(|| anyhow!("no template dir provided"))?;
+            .ok_or_else(|| eyre!("no template dir provided"))?;
 
         let candidate_list = {
             let mut candidate_list = Vec::new();
@@ -141,7 +146,7 @@ impl Mirage {
 impl Oneshot for Mirage {
     type Output = ();
 
-    async fn oneshot(&mut self) -> anyhow::Result<Self::Output> {
+    async fn oneshot(&mut self) -> eyre::Result<Self::Output> {
         let Self {
             configure_state,
             hydrate_state,
@@ -166,12 +171,46 @@ impl Oneshot for Mirage {
                 },
                 target_value = Oneshot::oneshot(control_state) => {
                     match target_value {
-                        Ok(target_request) => {
-                            dbg!(target_request);
+                        Ok((target_address, target_request)) => {
 
-                            ()
+                            let target_response = match target_request {
+                                ControlRequest::Ping => Ok::<_, eyre::Error>(ControlResponse::Pong),
+                                ControlRequest::Profile { name } => {
+                                    configure_state.profile().send(name)?;
+
+                                    Ok(ControlResponse::Acknowledge)
+                                },
+                                ControlRequest::Hydrate => {
+                                    // NOTE: This fakes out a mutation, which triggers a re-hydrate without us having to re-create the context.
+                                    configure_state.context().send_modify(|_| ());
+
+                                    Ok(ControlResponse::Acknowledge)
+                                },
+                                ControlRequest::Mutate { context } => {
+                                    let Ok(override_context) = tera::Context::from_value(context) else {
+                                        continue 'a
+                                    };
+
+                                    configure_state.context().send_modify(|target_context| {
+                                         target_context.extend(override_context)
+                                    });
+
+                                    Ok(ControlResponse::Acknowledge)
+                                }
+                            }?;
+
+                            if let Ok(serialize_response) = serde_json::to_string(&target_response) {
+                                // FIXME: Tokio does not have a `send_to_addr` associated function for UnixDatagram.
+                                if let Some(peer_path) = target_address.as_pathname() {
+                                    control_state.send_to(serialize_response.as_bytes(), peer_path).await?;
+                                }
+                            }
                         },
-                        Err(target_value) => break 'a Err(target_value)
+                        Err(target_value) => {
+                            eprintln!("{target_value:?}");
+
+                            continue 'a
+                        }
                     }
                 }
             );

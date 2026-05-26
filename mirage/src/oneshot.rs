@@ -6,5 +6,5 @@ pub trait Oneshot {
     type Output;
 
     /// Perform an oneshot activation.
-    fn oneshot(&mut self) -> impl Future<Output = anyhow::Result<Self::Output>>;
+    fn oneshot(&mut self) -> impl Future<Output = eyre::Result<Self::Output>>;
 }

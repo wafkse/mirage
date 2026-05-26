@@ -3,4 +3,3 @@ resolver = "3"
 members = ["mirage"]
 
 [workspace.dependencies]
-tokio = { version = "1.52.3", features = ["signal", "net", "fs", "macros", "tracing", "time", "sync", "rt-multi-thread", "process", "io-util"] }

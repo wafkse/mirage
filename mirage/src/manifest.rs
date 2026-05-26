@@ -83,7 +83,7 @@ impl ManifestCandidate {
     pub fn resolve_at(
         self,
         relative_root: impl AsRef<Path>,
-    ) -> anyhow::Result<impl Iterator<Item = Candidate> + FusedIterator> {
+    ) -> eyre::Result<impl Iterator<Item = Candidate> + FusedIterator> {
         let relative_root = relative_root.as_ref();
 
         let Self { path, policy } = self;
@@ -109,7 +109,7 @@ impl ManifestCandidate {
 
     /// Resolve a manifest candidate to a bare candidate relative the working directory.
     #[inline]
-    pub fn resolve(self) -> anyhow::Result<impl Iterator<Item = Candidate> + FusedIterator> {
+    pub fn resolve(self) -> eyre::Result<impl Iterator<Item = Candidate> + FusedIterator> {
         Self::resolve_at(self, std::env::current_dir()?)
     }
 }
