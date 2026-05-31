@@ -12,7 +12,7 @@ use tokio::{
 
 use tera::Tera;
 
-use crate::{filesystem::FsWatcher, oneshot::Oneshot};
+use crate::{background::Background, filesystem::FsWatcher};
 
 /// The hydration state for a set of configure candidates.
 #[derive(Debug)]
@@ -66,16 +66,16 @@ impl HydrationState {
     }
 }
 
-impl Oneshot for HydrationState {
+impl Background for HydrationState {
     type Output = ();
 
-    async fn oneshot(&mut self) -> eyre::Result<Self::Output> {
+    async fn run(self) -> eyre::Result<Self::Output> {
         let Self {
-            tera_state,
-            watcher_template,
-            context_pipe,
+            mut tera_state,
+            mut watcher_template,
+            mut context_pipe,
             template_root,
-            start_hydrate,
+            mut start_hydrate,
         } = self;
 
         /// An event to the hydration subsystem.
@@ -88,93 +88,96 @@ impl Oneshot for HydrationState {
             Context,
         }
 
-        let target_value = tokio::select!(
-            Some(target_event) = watcher_template.receiver_mut().recv() => HydrationEvent::Filesystem(target_event),
-            Ok(..) = context_pipe.changed() => HydrationEvent::Context
-        );
+        loop {
+            let target_value = tokio::select!(
+                Some(target_event) = watcher_template.receiver_mut().recv() => HydrationEvent::Filesystem(target_event),
+                Ok(..) = context_pipe.changed() => HydrationEvent::Context
+            );
 
-        let target_change = if !*start_hydrate {
-            *start_hydrate = true;
+            let target_change = if !start_hydrate {
+                start_hydrate = true;
 
-            true
-        } else {
-            match target_value {
-                HydrationEvent::Filesystem(notify::Event {
-                    kind:
-                        notify::EventKind::Modify(
-                            notify::event::ModifyKind::Name(..)
-                            | notify::event::ModifyKind::Data(..),
-                        )
-                        | notify::EventKind::Create(notify::event::CreateKind::File)
-                        | notify::EventKind::Remove(notify::event::RemoveKind::File),
-                    paths: path_list,
-                    ..
-                }) => path_list.into_iter().all(|file| {
-                    // NOTE: Check that this does affect Tera templates to avoid indirect self-recursion due to inplace hydration.
-                    file.extension()
-                        .map(|target_extension| target_extension.eq_ignore_ascii_case("tera"))
-                        .unwrap_or(false)
-                }),
-                HydrationEvent::Filesystem(notify::Event { kind: _, .. }) => false,
-                HydrationEvent::Context => true,
-            }
-        };
-
-        if target_change {
-            let mut change_closure =
-                async || -> eyre::Result<(TempDir, Vec<(PathBuf, PathBuf)>)> {
-                    // NOTE: Under a compatible circumstance, reload the complete Tera state.
-                    Tera::full_reload(tera_state)?;
-
-                    let mut rename_list = Vec::new();
-
-                    let temp_filedir = tempdir_in(template_root.as_path())?;
-
-                    for template_name in tera_state.get_template_names() {
-                        let mut template_path = template_root.join(template_name);
-
-                        let template_perms =
-                            fs::metadata(template_path.as_path()).await?.permissions();
-
-                        let mut temp_path = temp_filedir.path().join(template_name);
-
-                        // NOTE: Remove the `*.tera` extension from both the template and atomic tempfile path.
-                        template_path.set_extension("");
-                        temp_path.set_extension("");
-
-                        fs::create_dir_all(
-                            temp_path
-                                .parent()
-                                .ok_or_else(|| eyre!("tempfile does not have a parent"))?,
-                        )
-                        .await?;
-
-                        fs::write(
-                            temp_path.as_path(),
-                            Tera::render(tera_state, template_name, &context_pipe.borrow())?
-                                .as_bytes(),
-                        )
-                        .await?;
-
-                        fs::set_permissions(temp_path.as_path(), template_perms).await?;
-
-                        rename_list.push((temp_path, template_path));
-                    }
-
-                    Ok((temp_filedir, rename_list))
-                };
-
-            let target_value = change_closure().await;
-
-            if let Ok((.., rename_list)) = target_value {
-                for (from, to) in rename_list {
-                    fs::rename(from, to).await?;
+                true
+            } else {
+                match target_value {
+                    HydrationEvent::Filesystem(notify::Event {
+                        kind:
+                            notify::EventKind::Modify(
+                                notify::event::ModifyKind::Name(..)
+                                | notify::event::ModifyKind::Data(..),
+                            )
+                            | notify::EventKind::Create(notify::event::CreateKind::File)
+                            | notify::EventKind::Remove(notify::event::RemoveKind::File),
+                        paths: path_list,
+                        ..
+                    }) => path_list.into_iter().all(|file| {
+                        // NOTE: Check that this does affect Tera templates to avoid indirect self-recursion due to inplace hydration.
+                        file.extension()
+                            .map(|target_extension| target_extension.eq_ignore_ascii_case("tera"))
+                            .unwrap_or(false)
+                    }),
+                    HydrationEvent::Filesystem(notify::Event { kind: _, .. }) => false,
+                    HydrationEvent::Context => true,
                 }
-            } else if let Err(target_error) = target_value {
-                eprintln!("failed to render tera state: {}", target_error)
+            };
+
+            if target_change {
+                let tera_state = &mut tera_state;
+
+                let temp_filedir = tempdir_in(template_root.as_path())?;
+
+                let mut change_closure =
+                    async |temp_filedir: &TempDir| -> eyre::Result<Vec<(PathBuf, PathBuf)>> {
+                        // NOTE: Under a compatible circumstance, reload the complete Tera state.
+                        Tera::full_reload(tera_state)?;
+
+                        let mut rename_list = Vec::new();
+
+                        for template_name in tera_state.get_template_names() {
+                            let mut template_path = template_root.join(template_name);
+
+                            let template_perms =
+                                fs::metadata(template_path.as_path()).await?.permissions();
+
+                            let mut temp_path = temp_filedir.path().join(template_name);
+
+                            // NOTE: Remove the `*.tera` extension from both the template and atomic tempfile path.
+                            template_path.set_extension("");
+                            temp_path.set_extension("");
+
+                            fs::create_dir_all(
+                                temp_path
+                                    .parent()
+                                    .ok_or_else(|| eyre!("tempfile does not have a parent"))?,
+                            )
+                            .await?;
+
+                            let target_content = {
+                                let target_context = &context_pipe.borrow();
+
+                                Tera::render(tera_state, template_name, target_context)?
+                            };
+
+                            fs::write(temp_path.as_path(), target_content).await?;
+
+                            fs::set_permissions(temp_path.as_path(), template_perms).await?;
+
+                            rename_list.push((temp_path, template_path));
+                        }
+
+                        Ok(rename_list)
+                    };
+
+                let target_value = change_closure(&temp_filedir).await;
+
+                if let Ok(rename_list) = target_value {
+                    for (from, to) in rename_list {
+                        fs::rename(from, to).await?;
+                    }
+                } else if let Err(target_error) = target_value {
+                    eprintln!("failed to render tera state: {}", target_error)
+                }
             }
         }
-
-        Ok(())
     }
 }

@@ -68,7 +68,7 @@ pub enum MergePolicy {
 pub struct ManifestCandidate {
     /// The candidate path.
     ///
-    /// This may be a glob pattern.
+    /// This may be a glob pattern that may need future normalization.
     pub path: String,
 
     /// The merge policy for this candidate.
@@ -133,13 +133,13 @@ impl Candidate {
     {
         let Self { path, policy } = self;
 
-        let provider = Data::<F>::file(path).nested();
+        let target_data = Data::<F>::nested(Data::<F>::file(path));
 
         match policy {
-            MergePolicy::Override => Figment::merge(target_value, provider),
-            MergePolicy::Append => Figment::join(target_value, provider),
-            MergePolicy::Fallback => Figment::admerge(target_value, provider),
-            MergePolicy::Supplement => Figment::adjoin(target_value, provider),
+            MergePolicy::Override => Figment::merge(target_value, target_data),
+            MergePolicy::Append => Figment::join(target_value, target_data),
+            MergePolicy::Fallback => Figment::admerge(target_value, target_data),
+            MergePolicy::Supplement => Figment::adjoin(target_value, target_data),
         }
     }
 }

@@ -1,12 +1,14 @@
 //! Control state management.
 
-use std::ops::{Deref, DerefMut};
+use std::net::Shutdown;
 
-use bytes::BytesMut;
-use serde::{Deserialize, Serialize};
 use tokio::net::{UnixDatagram, unix::SocketAddr};
 
-use crate::oneshot::Oneshot;
+use bytes::{Buf, BytesMut};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{background::Background, state::configure::ConfigurePipe};
 
 /// A control message request.
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,54 +50,113 @@ pub enum ControlResponse {
     ///
     /// This is used for side-effectful control requests to indicate that the request was sucessfully processed.
     Acknowledge,
+
+    /// An error occurred while processing the control request.
+    Error {
+        /// The error message.
+        message: String,
+    },
 }
 
 /// The control state.
 #[derive(Debug)]
-pub struct ControlState {
-    /// The control socket for this control state.
-    control_socket: UnixDatagram,
-}
+pub struct ControlState(UnixDatagram, ConfigurePipe);
 
 impl ControlState {
     /// Instantiate a control state.
     #[inline]
-    pub const fn new(control_socket: UnixDatagram) -> Self {
-        Self { control_socket }
+    pub const fn new(control_socket: UnixDatagram, configure_pipe: ConfigurePipe) -> Self {
+        Self(control_socket, configure_pipe)
+    }
+
+    /// Handle a control message.
+    async fn handle(
+        ConfigurePipe(context_pipe, profile_pipe): &mut ConfigurePipe,
+        target_request: ControlRequest,
+    ) -> eyre::Result<ControlResponse> {
+        match target_request {
+            ControlRequest::Ping => Ok::<_, eyre::Error>(ControlResponse::Pong),
+            ControlRequest::Profile { name } => {
+                profile_pipe.send(name)?;
+
+                Ok(ControlResponse::Acknowledge)
+            }
+            ControlRequest::Hydrate => {
+                // NOTE: This fakes out a mutation, which triggers a re-hydrate without us having to re-create the context.
+                context_pipe.send_modify(|_| ());
+
+                Ok(ControlResponse::Acknowledge)
+            }
+            ControlRequest::Mutate { context } => {
+                let override_context =
+                    tera::Context::from_value(context).map_err(eyre::Report::from)?;
+
+                context_pipe.send_modify(|target_context| target_context.extend(override_context));
+
+                Ok(ControlResponse::Acknowledge)
+            }
+        }
     }
 }
 
-impl Oneshot for ControlState {
-    type Output = (SocketAddr, ControlRequest);
+impl Background for ControlState {
+    type Output = ();
 
-    async fn oneshot(&mut self) -> eyre::Result<Self::Output> {
-        let Self { control_socket, .. } = self;
+    async fn run(mut self) -> eyre::Result<Self::Output> {
+        let Self(ref mut target_endpoint, ref mut target_pipe) = self;
 
-        let mut control_buffer = BytesMut::new();
+        loop {
+            let mut recv_buf = BytesMut::new();
 
-        let (.., target_address) = control_socket.recv_buf_from(&mut control_buffer).await?;
+            let (byte_count, target_address) = target_endpoint.recv_buf_from(&mut recv_buf).await?;
 
-        Ok((
-            target_address,
-            serde_json::from_slice::<ControlRequest>(&control_buffer[..])?,
-        ))
+            let target_response =
+                match serde_json::from_slice::<ControlRequest>(&recv_buf[..byte_count])
+                    .map_err(eyre::Report::from)
+                {
+                    Ok(target_message) => ControlState::handle(target_pipe, target_message).await,
+                    Err(target_error) => Err(target_error),
+                };
+
+            recv_buf.advance(usize::MIN);
+
+            let target_response = match target_response
+                .map(|ref target_value| serde_json::to_string(target_value))
+                .map(|target_value| target_value.map_err(eyre::Report::from))
+            {
+                Ok(Ok(target_response)) => target_response,
+                Ok(Err(target_error)) | Err(target_error) => {
+                    serde_json::to_string(&ControlResponse::Error {
+                        message: target_error.to_string(),
+                    })
+                    .expect("failed to serialize error message")
+                }
+            };
+
+            if let Some(target_future) = target_address
+                .as_pathname()
+                .map(|target| target_endpoint.send_to(target_response.as_bytes(), target))
+            {
+                target_future.await?;
+            };
+        }
     }
 }
 
-impl Deref for ControlState {
-    type Target = UnixDatagram;
+impl Drop for ControlState {
+    fn drop(&mut self) {
+        let Self(target_endpoint, ..) = self;
 
-    fn deref(&self) -> &Self::Target {
-        let Self { control_socket, .. } = self;
+        let _ = target_endpoint.shutdown(Shutdown::Both);
 
-        control_socket
-    }
-}
-
-impl DerefMut for ControlState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        let Self { control_socket, .. } = self;
-
-        control_socket
+        if let Some(local_file) = target_endpoint
+            .local_addr()
+            .as_ref()
+            .map(SocketAddr::as_pathname)
+            .ok()
+            .flatten()
+        {
+            let _ = std::fs::remove_file(local_file);
+        }
     }
 }

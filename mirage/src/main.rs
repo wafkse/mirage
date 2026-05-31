@@ -13,13 +13,11 @@ use clap::Parser;
 
 use mirage::server::{Mirage, MirageCli};
 
-use mirage::oneshot::Oneshot;
+use mirage::background::Background;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let mut mirage_state = Mirage::new(MirageCli::parse())?;
-
-    match mirage_state.oneshot().await {
+    match Mirage::new(MirageCli::parse())?.run().await {
         Ok(..) => Ok(()),
         Err(target_value) => {
             eprintln!("{target_value:?}");

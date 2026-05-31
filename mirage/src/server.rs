@@ -1,24 +1,24 @@
 //! Server module.
 
-use std::{env, net::Shutdown, path::PathBuf};
+use std::{env::home_dir, path::PathBuf};
 
 use clap::Parser;
 
-use eyre::eyre;
+use eyre::{OptionExt, eyre};
 
 use figment::{
     Figment, Profile,
     providers::{Env, Format, Toml},
 };
 
-use tokio::{fs, net::UnixDatagram, signal};
+use tokio::{net::UnixDatagram, signal, task::JoinSet};
 
 use crate::{
+    background::Background,
     manifest::{Manifest, ManifestCandidate, ManifestConfigure},
-    oneshot::Oneshot,
     state::{
-        configure::ConfigureState,
-        control::{ControlRequest, ControlResponse, ControlState},
+        configure::{ConfigurePipe, ConfigureState},
+        control::ControlState,
         hydrate::HydrationState,
     },
 };
@@ -28,19 +28,19 @@ use crate::{
 pub struct MirageCli {
     /// The list of configure candidates.
     #[arg(short = 'C', long)]
-    configure: PathBuf,
+    pub configure: PathBuf,
 
     /// The profile selected for the context.
     #[arg(short = 'P', long)]
-    profile: Option<String>,
+    pub profile: Option<String>,
 
     /// The path to the Unix Domain Socket to listen to for daemon control.
     #[arg(short = 'L', long = "listen")]
-    listen_sock: Option<PathBuf>,
+    pub listen_sock: Option<PathBuf>,
 
     /// The path to the template directory.
     #[arg(short = 'T', long = "template", required = false)]
-    template_root: Option<PathBuf>,
+    pub template_root: Option<PathBuf>,
 }
 
 /// The primary state of a Mirage process.
@@ -64,10 +64,10 @@ pub struct Mirage {
 
 impl Mirage {
     /// The basename of the manifest dotfile.
-    const MIRAGE_MANIFEST_DOTFILE: &str = ".mirage.toml";
+    pub const MIRAGE_MANIFEST_DOTFILE: &str = ".mirage.toml";
 
     /// The basename of the unix domain socket dotfile.
-    const MIRAGE_SOCK_DOTFILE: &str = ".mirage.sock";
+    pub const MIRAGE_SOCK_DOTFILE: &str = ".mirage.sock";
 
     /// Construct a new daemon state from the target settings.
     #[inline]
@@ -77,6 +77,7 @@ impl Mirage {
             profile: command_profile,
             template_root: command_template,
             listen_sock: command_sock,
+            ..
         } = &target_settings;
 
         let Manifest {
@@ -125,15 +126,20 @@ impl Mirage {
         let configure_state = ConfigureState::new(candidate_list, target_profile)?;
 
         let hydrate_state =
-            HydrationState::new(template_root, configure_state.context().subscribe())?;
+            HydrationState::new(template_root, configure_state.pipe().context().subscribe())?;
 
-        let control_state = ControlState::new(UnixDatagram::bind(
+        let control_socket = UnixDatagram::bind(
             if let Some(sock_name) = command_sock.as_ref().or(manifest_sock.as_ref()) {
                 sock_name.to_path_buf()
             } else {
-                env::var("HOME").map(|home| PathBuf::from(home).join(Self::MIRAGE_SOCK_DOTFILE))?
+                home_dir()
+                    .map(|home| home.join(Self::MIRAGE_SOCK_DOTFILE))
+                    .ok_or_eyre("could not get default socket path")?
             },
-        )?);
+        )?;
+
+        let control_state =
+            ControlState::new(control_socket, ConfigurePipe::clone(configure_state.pipe()));
 
         Ok(Self {
             configure_state,
@@ -143,84 +149,35 @@ impl Mirage {
     }
 }
 
-impl Oneshot for Mirage {
+impl Background for Mirage {
     type Output = ();
 
-    async fn oneshot(&mut self) -> eyre::Result<Self::Output> {
+    async fn run(self) -> eyre::Result<Self::Output> {
         let Self {
             configure_state,
             hydrate_state,
             control_state,
         } = self;
 
-        let target_value = 'a: loop {
+        let mut thread_set = JoinSet::new();
+
+        let _ = thread_set.spawn(Background::run(configure_state));
+        let _ = thread_set.spawn(Background::run(hydrate_state));
+        let _ = thread_set.spawn(Background::run(control_state));
+
+        let target_value = 'a: {
             tokio::select!(
                 // NOTE: The nest level of inner breakable blocks emitted by the macro is unknown, so the label is required.
                 Ok(..) = signal::ctrl_c() => break 'a Ok(()),
-                target_value = Oneshot::oneshot(configure_state) => {
-                    match target_value {
-                        Ok(..) => (),
-                        target_value @ Err(..) => break 'a target_value
+                target_value = thread_set.join_all() => {
+                    for target_value in target_value {
+                        let _ = target_value?;
                     }
+
+                    Ok(())
                 },
-                target_value = Oneshot::oneshot(hydrate_state) => {
-                    match target_value {
-                        Ok(..) => (),
-                        target_value @ Err(..) => break 'a target_value
-                    }
-                },
-                target_value = Oneshot::oneshot(control_state) => {
-                    match target_value {
-                        Ok((target_address, target_request)) => {
-
-                            let target_response = match target_request {
-                                ControlRequest::Ping => Ok::<_, eyre::Error>(ControlResponse::Pong),
-                                ControlRequest::Profile { name } => {
-                                    configure_state.profile().send(name)?;
-
-                                    Ok(ControlResponse::Acknowledge)
-                                },
-                                ControlRequest::Hydrate => {
-                                    // NOTE: This fakes out a mutation, which triggers a re-hydrate without us having to re-create the context.
-                                    configure_state.context().send_modify(|_| ());
-
-                                    Ok(ControlResponse::Acknowledge)
-                                },
-                                ControlRequest::Mutate { context } => {
-                                    let Ok(override_context) = tera::Context::from_value(context) else {
-                                        continue 'a
-                                    };
-
-                                    configure_state.context().send_modify(|target_context| {
-                                         target_context.extend(override_context)
-                                    });
-
-                                    Ok(ControlResponse::Acknowledge)
-                                }
-                            }?;
-
-                            if let Ok(serialize_response) = serde_json::to_string(&target_response) {
-                                // FIXME: Tokio does not have a `send_to_addr` associated function for UnixDatagram.
-                                if let Some(peer_path) = target_address.as_pathname() {
-                                    control_state.send_to(serialize_response.as_bytes(), peer_path).await?;
-                                }
-                            }
-                        },
-                        Err(target_value) => {
-                            eprintln!("{target_value:?}");
-
-                            continue 'a
-                        }
-                    }
-                }
-            );
+            )
         };
-
-        control_state.shutdown(Shutdown::Both)?;
-
-        if let Some(local_file) = control_state.local_addr()?.as_pathname() {
-            fs::remove_file(local_file).await?;
-        }
 
         target_value
     }
