@@ -69,7 +69,9 @@ pub enum MergePolicy {
 /// A path pattern and merge policy declared by a `[[candidate]]` entry.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManifestCandidate {
-    /// A path or glob pattern selecting configure files.
+    /// The candidate path.
+    ///
+    /// Shell expansion and glob matching occur in [`Self::resolve_at`].
     pub path: String,
 
     /// The merge policy for this candidate.
@@ -132,13 +134,13 @@ impl Candidate {
     {
         let Self { path, policy } = self;
 
-        let provider = Data::<F>::file(path).nested();
+        let target_data = Data::<F>::nested(Data::<F>::file(path));
 
         match policy {
-            MergePolicy::Override => Figment::merge(target_value, provider),
-            MergePolicy::Append => Figment::join(target_value, provider),
-            MergePolicy::Fallback => Figment::admerge(target_value, provider),
-            MergePolicy::Supplement => Figment::adjoin(target_value, provider),
+            MergePolicy::Override => Figment::merge(target_value, target_data),
+            MergePolicy::Append => Figment::join(target_value, target_data),
+            MergePolicy::Fallback => Figment::admerge(target_value, target_data),
+            MergePolicy::Supplement => Figment::adjoin(target_value, target_data),
         }
     }
 }

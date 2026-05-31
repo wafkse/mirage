@@ -1,0 +1,15 @@
+[package]
+name = "miragectl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mirage = { version = "*", path = "../mirage" }
+
+bytes.workspace = true
+tokio.workspace = true
+clap.workspace = true
+eyre.workspace = true
+tempfile.workspace = true
+figment.workspace = true
+serde_json.workspace = true
