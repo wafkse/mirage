@@ -11,7 +11,14 @@ use figment::{
     providers::{Env, Format, Toml},
 };
 
-use tokio::{net::UnixDatagram, signal, task::JoinSet};
+use tokio::{
+    net::UnixDatagram,
+    signal::{
+        self,
+        unix::{SignalKind, signal},
+    },
+    task::JoinSet,
+};
 
 use crate::{
     background::Background,
@@ -165,10 +172,13 @@ impl Background for Mirage {
         let _ = thread_set.spawn(Background::run(hydrate_state));
         let _ = thread_set.spawn(Background::run(control_state));
 
+        let mut terminate_signal = signal(SignalKind::terminate())?;
+
         let target_value = 'a: {
             tokio::select!(
                 // NOTE: The nest level of inner breakable blocks emitted by the macro is unknown, so the label is required.
                 Ok(..) = signal::ctrl_c() => break 'a Ok(()),
+                Some(..) = terminate_signal.recv() => break 'a Ok(()),
                 target_value = thread_set.join_all() => {
                     for target_value in target_value {
                         let _ = target_value?;
