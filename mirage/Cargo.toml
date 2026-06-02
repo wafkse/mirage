@@ -17,3 +17,5 @@ tempfile.workspace = true
 tera.workspace = true
 toml.workspace = true
 walkdir.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
