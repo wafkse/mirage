@@ -33,6 +33,9 @@ pub enum ControlCommand {
 
     /// Merge a transient TOML fragment into the daemon's render context.
     Mutate { value: String },
+
+    /// Print the daemon's current render context as a JSON response.
+    Context,
 }
 
 /// Socket selection and command for a control client invocation.
@@ -80,6 +83,7 @@ async fn main() -> eyre::Result<()> {
         ControlCommand::Mutate { value } => ControlRequest::Mutate {
             context: serde_json::from_str(value.as_str())?,
         },
+        ControlCommand::Context => ControlRequest::Context,
     };
 
     socket

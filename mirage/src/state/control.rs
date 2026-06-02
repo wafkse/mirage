@@ -35,6 +35,11 @@ pub enum ControlRequest {
         /// Values to merge into the render context.
         context: serde_json::Value,
     },
+
+    /// A context message.
+    ///
+    /// This permits dumping the context of the daemon to a requesting client.
+    Context,
 }
 
 /// A control message response.
@@ -48,6 +53,14 @@ pub enum ControlResponse {
     ///
     /// The context update or profile notification was accepted. Rendering proceeds asynchronously.
     Acknowledge,
+
+    /// A context message.
+    ///
+    /// Contains the current render context encoded as JSON.
+    Context {
+        /// The associated context.
+        context: serde_json::Value,
+    },
 
     /// An error occurred while processing the control request.
     Error {
@@ -96,6 +109,11 @@ impl ControlState {
                 context_pipe.send_modify(|target_context| target_context.extend(override_context));
 
                 Ok(ControlResponse::Acknowledge)
+            }
+            ControlRequest::Context => {
+                let context = context_pipe.borrow().clone().into_json();
+
+                Ok(ControlResponse::Context { context })
             }
         }
     }
