@@ -1,12 +1,15 @@
 //! Control state management.
 
-use std::net::Shutdown;
+use futures::{SinkExt, StreamExt};
+use tokio::{
+    net::{UnixListener, UnixStream, unix::SocketAddr},
+    sync::{mpsc, oneshot},
+};
 
-use tokio::net::{UnixDatagram, unix::SocketAddr};
-
-use bytes::{Buf, BytesMut};
+use bytes::Bytes;
 
 use serde::{Deserialize, Serialize};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::{background::Background, state::configure::ConfigurePipe};
 
@@ -73,13 +76,13 @@ pub enum ControlResponse {
 
 /// The control state.
 #[derive(Debug)]
-pub struct ControlState(UnixDatagram, ConfigurePipe);
+pub struct ControlState(UnixListener, ConfigurePipe);
 
 impl ControlState {
     /// Instantiate a control state.
     #[inline]
-    pub const fn new(control_socket: UnixDatagram, configure_pipe: ConfigurePipe) -> Self {
-        Self(control_socket, configure_pipe)
+    pub const fn new(control_listener: UnixListener, configure_pipe: ConfigurePipe) -> Self {
+        Self(control_listener, configure_pipe)
     }
 
     /// Handle a control message.
@@ -123,45 +126,84 @@ impl Background for ControlState {
     async fn run(mut self) -> eyre::Result<Self::Output> {
         let Self(ref mut target_endpoint, ref mut target_pipe) = self;
 
+        let (ref state_send, mut state_recv) = mpsc::unbounded_channel::<(
+            ControlRequest,
+            oneshot::Sender<eyre::Result<ControlResponse>>,
+        )>();
+
+        enum Operation {
+            Socket(UnixStream),
+            Request(
+                (
+                    ControlRequest,
+                    oneshot::Sender<eyre::Result<ControlResponse>>,
+                ),
+            ),
+        }
+
         loop {
-            let mut recv_buf = BytesMut::new();
+            let target_operate = tokio::select!(
+               Ok((target_left, ..)) = target_endpoint.accept() => Operation::Socket(target_left),
+               Some(target_tuple) = state_recv.recv() => {
+                  Operation::Request(target_tuple)
+              }
+            );
 
-            let (byte_count, target_address) = target_endpoint.recv_buf_from(&mut recv_buf).await?;
+            match target_operate {
+                Operation::Socket(target_io) => {
+                    let control_endpoint = mpsc::UnboundedSender::clone(state_send);
 
-            let target_response =
-                match serde_json::from_slice::<ControlRequest>(&recv_buf[..byte_count])
-                    .map_err(eyre::Report::from)
-                {
-                    Ok(target_message) => ControlState::handle(target_pipe, target_message).await,
-                    Err(target_error) => Err(target_error),
-                };
+                    let mut framed_endpoint = Framed::new(target_io, LengthDelimitedCodec::new());
 
-            recv_buf.advance(usize::MIN);
+                    let target_handle = async move {
+                        while let Some(Ok(target_value)) = framed_endpoint.next().await {
+                            let target_response = match serde_json::from_slice::<ControlRequest>(
+                                target_value.iter().as_slice(),
+                            )
+                            .map_err(eyre::Report::from)
+                            {
+                                Ok(target_value) => {
+                                    let (target_left, target_response) = oneshot::channel();
 
-            let target_response = match target_response
-                .map(|ref target_value| serde_json::to_string(target_value))
-                .map(|target_value| target_value.map_err(eyre::Report::from))
-            {
-                Ok(Ok(target_response)) => target_response,
-                Ok(Err(target_error)) | Err(target_error) => {
-                    serde_json::to_string(&ControlResponse::Error {
-                        message: target_error.to_string(),
-                    })
-                    .expect("failed to serialize error message")
+                                    match control_endpoint
+                                        .send((target_value, target_left))
+                                        .map_err(eyre::Report::from)
+                                    {
+                                        Ok(..) => target_response
+                                            .await
+                                            .map_err(eyre::Report::from)
+                                            .flatten(),
+                                        Err(target_error) => Err(target_error),
+                                    }
+                                }
+                                Err(target_error) => Err(target_error),
+                            };
+
+                            let ref target_response = match target_response {
+                                Ok(target_value) => target_value,
+                                Err(target_error) => ControlResponse::Error {
+                                    message: target_error.to_string(),
+                                },
+                            };
+
+                            if let Ok(target_value) = serde_json::to_string(target_response) {
+                                let _ = framed_endpoint
+                                    .send(Bytes::copy_from_slice(target_value.as_bytes()))
+                                    .await;
+                            }
+                        }
+                    };
+
+                    tokio::spawn(target_handle);
                 }
-            };
-
-            if let Some(target_pathname) = target_address.as_pathname() {
-                let target_response = target_response.as_bytes();
-
-                let mut byte_count = target_response.len();
-
-                while byte_count > 0 {
-                    byte_count -= target_endpoint
-                        .send_to(target_response, target_pathname)
-                        .await?;
+                Operation::Request((target_message, target_channel)) => {
+                    let _ = target_channel.send(
+                        ControlState::handle(target_pipe, target_message)
+                            .await
+                            .map_err(eyre::Report::from),
+                    );
                 }
-            };
+            }
         }
     }
 }
@@ -169,8 +211,6 @@ impl Background for ControlState {
 impl Drop for ControlState {
     fn drop(&mut self) {
         let Self(target_endpoint, ..) = self;
-
-        let _ = target_endpoint.shutdown(Shutdown::Both);
 
         if let Some(local_file) = target_endpoint
             .local_addr()

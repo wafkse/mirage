@@ -6,12 +6,19 @@ use std::{
     path::PathBuf,
 };
 
+use bytes::Bytes;
 use clap::Parser;
 
 use eyre::OptionExt;
+
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+
 use mirage::{server::Mirage, state::control::ControlRequest};
-use tempfile::TempDir;
-use tokio::net::UnixDatagram;
+
+use tokio::net::UnixStream;
+
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// The name of the receive end socket for a `miragectl` instance.
 pub const RECEIVE_SOCKET_NAME: &str = "miragectl.sock";
@@ -59,19 +66,18 @@ async fn main() -> eyre::Result<()> {
     } = MirageCtlCli::parse();
 
     // FIXME: Deduplicate this logic between server and control client.
-    let connect_path = if let Some(connect_path) = connect_path {
-        connect_path
+    let target_sock = if let Some(target_sock) = connect_path {
+        target_sock
     } else {
         home_dir()
             .map(|home| home.join(Mirage::MIRAGE_SOCK_DOTFILE))
             .ok_or_eyre("could not get default socket path")?
     };
 
-    let socket_dir = TempDir::new()?;
-
-    let socket = UnixDatagram::bind(socket_dir.path().join(RECEIVE_SOCKET_NAME))?;
-
-    socket.connect(connect_path)?;
+    let mut target_endpoint = Framed::new(
+        UnixStream::connect(target_sock).await?,
+        LengthDelimitedCodec::new(),
+    );
 
     let ref control_request = match control_command {
         ControlCommand::Ping => ControlRequest::Ping,
@@ -85,15 +91,17 @@ async fn main() -> eyre::Result<()> {
         ControlCommand::Context => ControlRequest::Context,
     };
 
-    socket
-        .send(serde_json::to_string(control_request)?.as_bytes())
+    target_endpoint
+        .send(Bytes::copy_from_slice(
+            serde_json::to_string(control_request)?.as_bytes(),
+        ))
         .await?;
 
-    let mut recv_buf = bytes::BytesMut::new();
-
-    let byte_count = socket.recv_buf(&mut recv_buf).await?;
-
-    io::stdout().lock().write_all(&recv_buf[..byte_count])?;
+    if let Some(target_value) = target_endpoint.next().await {
+        io::stdout()
+            .lock()
+            .write_all(target_value?.iter().as_slice())?;
+    }
 
     Ok(())
 }

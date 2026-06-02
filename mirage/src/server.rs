@@ -12,7 +12,7 @@ use figment::{
 };
 
 use tokio::{
-    net::UnixDatagram,
+    net::UnixListener,
     signal::{
         self,
         unix::{SignalKind, signal},
@@ -135,7 +135,7 @@ impl Mirage {
         let hydrate_state =
             HydrationState::new(template_root, configure_state.pipe().context().subscribe())?;
 
-        let control_socket = UnixDatagram::bind(
+        let control_socket = UnixListener::bind(
             if let Some(sock_name) = command_sock.as_ref().or(manifest_sock.as_ref()) {
                 sock_name.to_path_buf()
             } else {
