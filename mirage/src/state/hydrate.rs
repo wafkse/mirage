@@ -175,7 +175,12 @@ impl Background for HydrationState {
                         fs::rename(from, to).await?;
                     }
                 } else if let Err(target_error) = target_value {
-                    eprintln!("failed to render tera state: {}", target_error)
+                    for (error_index, target_cause) in target_error.chain().enumerate() {
+                        match error_index {
+                            0 => eprintln!("Error: {}", target_cause),
+                            1.. => eprintln!("Caused by: {}", target_cause),
+                        }
+                    }
                 }
             }
         }
