@@ -37,6 +37,11 @@ pub enum ControlRequest {
         /// The to mutate the source context with.
         context: serde_json::Value,
     },
+
+    /// A context message.
+    ///
+    /// This permits dumping the context of the daemon to a requesting client.
+    Context,
 }
 
 /// A control message response.
@@ -50,6 +55,14 @@ pub enum ControlResponse {
     ///
     /// This is used for side-effectful control requests to indicate that the request was sucessfully processed.
     Acknowledge,
+
+    /// A context message.
+    ///
+    /// This is used to dump the complete context of the daemon.
+    Context {
+        /// The associated context.
+        context: serde_json::Value,
+    },
 
     /// An error occurred while processing the control request.
     Error {
@@ -94,6 +107,11 @@ impl ControlState {
                 context_pipe.send_modify(|target_context| target_context.extend(override_context));
 
                 Ok(ControlResponse::Acknowledge)
+            }
+            ControlRequest::Context => {
+                let context = context_pipe.borrow().clone().into_json();
+
+                Ok(ControlResponse::Context { context })
             }
         }
     }

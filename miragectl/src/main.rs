@@ -33,6 +33,9 @@ pub enum ControlCommand {
 
     /// Mutate the context used in the daemon for hydrate processes in a transient manner.
     Mutate { value: String },
+
+    /// Tell the daemon to dump its complete context to us.
+    Context,
 }
 
 /// A command-line utility to control an online Mirage Daemon.
@@ -79,6 +82,7 @@ async fn main() -> eyre::Result<()> {
         ControlCommand::Mutate { value } => ControlRequest::Mutate {
             context: serde_json::from_str(value.as_str())?,
         },
+        ControlCommand::Context => ControlRequest::Context,
     };
 
     socket
