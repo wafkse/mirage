@@ -151,11 +151,16 @@ impl Background for ControlState {
                 }
             };
 
-            if let Some(target_future) = target_address
-                .as_pathname()
-                .map(|target| target_endpoint.send_to(target_response.as_bytes(), target))
-            {
-                target_future.await?;
+            if let Some(target_pathname) = target_address.as_pathname() {
+                let target_response = target_response.as_bytes();
+
+                let mut byte_count = target_response.len();
+
+                while byte_count > 0 {
+                    byte_count -= target_endpoint
+                        .send_to(target_response, target_pathname)
+                        .await?;
+                }
             };
         }
     }
