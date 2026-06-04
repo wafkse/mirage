@@ -82,12 +82,12 @@ impl ManifestCandidate {
     /// Collect matching candidates relative to the supplied root.
     #[inline]
     pub fn resolve_at(
-        self,
+        &self,
         relative_root: impl AsRef<Path>,
     ) -> eyre::Result<impl Iterator<Item = Candidate> + FusedIterator> {
         let relative_root = relative_root.as_ref();
 
-        let Self { path, policy } = self;
+        let &Self { ref path, policy } = self;
 
         let mut target_list = Vec::new();
 
@@ -106,12 +106,6 @@ impl ManifestCandidate {
         }
 
         Ok(target_list.into_iter())
-    }
-
-    /// Resolve a manifest candidate to a bare candidate relative the working directory.
-    #[inline]
-    pub fn resolve(self) -> eyre::Result<impl Iterator<Item = Candidate> + FusedIterator> {
-        Self::resolve_at(self, std::env::current_dir()?)
     }
 }
 
