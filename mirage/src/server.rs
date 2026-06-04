@@ -22,7 +22,7 @@ use tokio::{
 
 use crate::{
     background::Background,
-    manifest::{Manifest, ManifestCandidate, ManifestConfigure},
+    manifest::{Manifest, ManifestConfigure},
     state::{
         configure::{ConfigurePipe, ConfigureState},
         control::ControlState,
@@ -33,7 +33,7 @@ use crate::{
 /// The Mirage command-line daemon.
 #[derive(Debug, Clone, Parser)]
 pub struct MirageCli {
-    /// The list of configure candidates.
+    /// The path to the directory of configure candidates.
     #[arg(short = 'C', long)]
     pub configure: PathBuf,
 
@@ -94,7 +94,7 @@ impl Mirage {
                     listen_sock: manifest_sock,
                     profile: manifest_profile,
                 },
-            candidate,
+            candidate: candidate_list,
         } = Figment::new()
             .merge(Toml::file(
                 command_configure.join(Self::MIRAGE_MANIFEST_DOTFILE),
@@ -108,29 +108,16 @@ impl Mirage {
             .or(manifest_template.as_ref())
             .ok_or_else(|| eyre!("no template dir provided"))?;
 
-        let candidate_list = {
-            let mut candidate_list = Vec::new();
-
-            let target_iter = candidate.into_iter().map(|candidate| {
-                ManifestCandidate::resolve_at(candidate, command_configure.as_path())
-            });
-
-            for target_value in target_iter {
-                candidate_list.extend(target_value?);
-            }
-
-            candidate_list
-        };
-
-        let target_profile = command_profile
-            .as_ref()
-            .or(manifest_profile.as_ref())
-            .as_deref()
-            .map(String::as_str)
-            .map(Profile::new)
-            .unwrap_or(Profile::Default);
-
-        let configure_state = ConfigureState::new(candidate_list, target_profile)?;
+        let configure_state = ConfigureState::new(
+            (command_configure.as_path(), candidate_list),
+            command_profile
+                .as_ref()
+                .or(manifest_profile.as_ref())
+                .as_deref()
+                .map(String::as_str)
+                .map(Profile::new)
+                .unwrap_or(Profile::Default),
+        )?;
 
         let hydrate_state =
             HydrationState::new(template_root, configure_state.pipe().context().subscribe())?;

@@ -1,9 +1,13 @@
 //! Configure state management.
 
-use std::ops::Deref;
+use std::{
+    ops::Deref,
+    path::{Path, PathBuf},
+};
 
 use figment::{Figment, Profile, providers::Env};
 
+use glob::Pattern;
 use notify::{RecursiveMode, Watcher};
 
 use tokio::sync::watch;
@@ -11,7 +15,7 @@ use tokio::sync::watch;
 use crate::{
     background::Background,
     filesystem::FsWatcher,
-    manifest::{self, Candidate, MergePolicy},
+    manifest::{self, ManifestCandidate},
 };
 
 /// The configure pipe of a [`ConfigureState`].
@@ -60,8 +64,13 @@ pub struct ConfigureState {
     /// The configure candidate filesystem watcher.
     configure_watch: FsWatcher,
 
-    /// The list of configure candidates.
-    candidate_list: Vec<Candidate>,
+    /// The root to tree of configure candidates.
+    candidate_tree: PathBuf,
+
+    /// The list of manifest candidates.
+    ///
+    /// This is used to categorise and filter the existing candidates in the configure directory.
+    manifest_candidates: Vec<ManifestCandidate>,
 
     /// The pipe used for Tera context and profile management.
     configure_pipe: ConfigurePipe,
@@ -70,36 +79,55 @@ pub struct ConfigureState {
 impl ConfigureState {
     /// Instantiate a [`ConfigureState`] with the target configure candidate list.
     #[inline]
-    pub fn new(candidate_list: Vec<Candidate>, target_profile: Profile) -> eyre::Result<Self> {
+    pub fn new(
+        (candidate_tree, manifest_candidates): (&Path, Vec<ManifestCandidate>),
+        context_profile: Profile,
+    ) -> eyre::Result<Self> {
         let configure_watch = {
-            let mut configure_watch = FsWatcher::standard()?;
+            let mut target_value = FsWatcher::standard()?;
 
-            for Candidate { path, .. } in candidate_list.as_slice() {
-                configure_watch.watch(path, RecursiveMode::NonRecursive)?;
-            }
+            target_value.watch(candidate_tree, RecursiveMode::Recursive)?;
 
-            configure_watch
+            target_value
         };
 
-        let target_context = candidate_list
+        let configure_list = {
+            let mut target_list = Vec::new();
+
+            for target_value in manifest_candidates
+                .iter()
+                .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
+            {
+                let target_value = target_value?;
+
+                target_list.extend(target_value);
+            }
+
+            target_list
+        };
+
+        let target_context = configure_list
             .iter()
             .fold(Figment::new(), |target_value: Figment, target_candidate| {
-                Candidate::combine::<manifest::DefaultFormat>(target_candidate, target_value)
+                target_candidate.combine::<manifest::DefaultFormat>(target_value)
             })
             .merge(Env::prefixed("MIRAGE_"))
-            .select(target_profile.clone())
+            .select(context_profile.clone())
             .extract::<toml::Value>()
             .map(tera::Context::from_serialize)??;
 
         let (context_sender, ..) = watch::channel(target_context);
 
-        let (profile_sender, ..) = watch::channel(target_profile);
+        let (profile_sender, ..) = watch::channel(context_profile);
 
         let configure_pipe = ConfigurePipe(context_sender, profile_sender);
 
+        let candidate_tree = candidate_tree.to_path_buf();
+
         Ok(Self {
             configure_watch,
-            candidate_list,
+            candidate_tree,
+            manifest_candidates,
             configure_pipe,
         })
     }
@@ -127,10 +155,17 @@ impl Background for ConfigureState {
     async fn run(self) -> eyre::Result<Self::Output> {
         let Self {
             mut configure_watch,
-            mut candidate_list,
+            manifest_candidates,
             configure_pipe: ConfigurePipe(context_send, profile_send),
+            candidate_tree,
             ..
         } = self;
+
+        let ref candidate_tree = if candidate_tree.is_relative() {
+            std::env::current_dir()?.join(candidate_tree)
+        } else {
+            candidate_tree
+        };
 
         let mut profile_recv = profile_send.subscribe();
 
@@ -149,65 +184,71 @@ impl Background for ConfigureState {
 
             let target_state = match target_value {
                 ConfigureEvent::Filesystem(notify::Event {
-                    kind: notify::EventKind::Create(notify::event::CreateKind::File),
+                    kind:
+                        notify::EventKind::Create(notify::event::CreateKind::File)
+                        | notify::EventKind::Remove(notify::event::RemoveKind::File)
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Data(..)),
+
                     paths: path_list,
                     ..
                 }) => {
+                    path_list.as_slice();
+
                     let mut target_change = false;
 
-                    for path in path_list {
-                        configure_watch.watch(path.as_path(), RecursiveMode::NonRecursive)?;
+                    let pattern_list: Vec<Pattern> = manifest_candidates
+                        .iter()
+                        .map(|ManifestCandidate { path, .. }| path)
+                        .map(String::as_str)
+                        .map(Pattern::new)
+                        .collect::<Result<_, glob::PatternError>>()?;
 
-                        let policy = MergePolicy::default();
+                    for file in path_list {
+                        let file = file.strip_prefix(candidate_tree.as_path())?;
 
-                        candidate_list.push(Candidate { path, policy });
+                        target_change = pattern_list
+                            .iter()
+                            .any(|pattern| pattern.matches_path(file));
 
-                        target_change = true;
+                        if target_change {
+                            break;
+                        }
                     }
 
                     target_change
                 }
-                ConfigureEvent::Filesystem(notify::Event {
-                    kind: notify::EventKind::Remove(notify::event::RemoveKind::File),
-                    paths: path_list,
-                    ..
-                }) => {
-                    let mut target_change = false;
 
-                    for ref target_path in path_list {
-                        // NOTE: There is no need to remove the removed file from the filesystem watcher as the `notify` crate will do it automatically.
-
-                        candidate_list.retain(|Candidate { path, .. }| path != target_path);
-
-                        target_change = true;
-                    }
-
-                    target_change
-                }
-                // NOTE: Unconditiionally re-hydrate on *any* modification event.
-                ConfigureEvent::Filesystem(notify::Event {
-                    kind: notify::EventKind::Modify(notify::event::ModifyKind::Data(..)),
-                    ..
-                }) => true,
                 ConfigureEvent::Profile => true,
                 _ => false,
             };
 
             if target_state {
-                context_send.send(
-                    candidate_list
+                let configure_list = {
+                    let mut target_list = Vec::new();
+
+                    for target_value in manifest_candidates
                         .iter()
-                        .fold(Figment::new(), |target_value, target_candidate| {
-                            Candidate::combine::<manifest::DefaultFormat>(
-                                target_candidate,
-                                target_value,
-                            )
-                        })
-                        .merge(Env::prefixed("MIRAGE_"))
-                        .select(Profile::clone(profile_recv.borrow().deref()))
-                        .extract::<toml::Value>()
-                        .map(tera::Context::from_serialize)??,
-                )?;
+                        .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
+                    {
+                        let target_value = target_value?;
+
+                        target_list.extend(target_value);
+                    }
+
+                    target_list
+                };
+
+                let target_context = configure_list
+                    .iter()
+                    .fold(Figment::new(), |target_value: Figment, target_candidate| {
+                        target_candidate.combine::<manifest::DefaultFormat>(target_value)
+                    })
+                    .merge(Env::prefixed("MIRAGE_"))
+                    .select(Profile::clone(profile_recv.borrow().deref()))
+                    .extract::<toml::Value>()
+                    .map(tera::Context::from_serialize)??;
+
+                context_send.send(target_context)?;
             }
         }
     }
