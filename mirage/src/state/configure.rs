@@ -180,6 +180,13 @@ impl Background for ConfigureState {
     type Output = ();
 
     async fn run(self) -> eyre::Result<Self::Output> {
+        /// The distinct events managed by the `ConfigureState`.
+        #[derive(Debug)]
+        enum ConfigureEvent {
+            Filesystem(notify::Event),
+            Profile,
+        }
+
         let Self {
             mut configure_watch,
             manifest_candidates,
@@ -188,20 +195,13 @@ impl Background for ConfigureState {
             ..
         } = self;
 
-        let ref candidate_tree = if candidate_tree.is_relative() {
+        let candidate_tree = &if candidate_tree.is_relative() {
             std::env::current_dir()?.join(candidate_tree)
         } else {
             candidate_tree
         };
 
         let mut profile_recv = profile_send.subscribe();
-
-        /// The distinct events managed by the `ConfigureState`.
-        #[derive(Debug)]
-        enum ConfigureEvent {
-            Filesystem(notify::Event),
-            Profile,
-        }
 
         loop {
             let target_value = tokio::select!(
@@ -246,34 +246,17 @@ impl Background for ConfigureState {
                 }
 
                 ConfigureEvent::Profile => true,
-                _ => false,
+                ConfigureEvent::Filesystem(..) => false,
             };
 
             if target_state {
-                let configure_list = {
-                    let mut target_list = Vec::new();
+                let target_context = fold_context(
+                    candidate_tree.as_path(),
+                    &manifest_candidates,
+                    &Profile::clone(profile_recv.borrow().deref()),
+                )?;
 
-                    for target_value in manifest_candidates
-                        .iter()
-                        .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
-                    {
-                        let target_value = target_value?;
-
-                        target_list.extend(target_value);
-                    }
-
-                    target_list
-                };
-
-                let target_context = configure_list
-                    .iter()
-                    .fold(Figment::new(), |target_value: Figment, target_candidate| {
-                        target_candidate.combine::<manifest::DefaultFormat>(target_value)
-                    })
-                    .merge(Env::prefixed("MIRAGE_"))
-                    .select(Profile::clone(profile_recv.borrow().deref()))
-                    .extract::<toml::Value>()
-                    .map(tera::Context::from_serialize)??;
+                tracing::info!("configure context recomputed");
 
                 context_send.send(target_context)?;
             }
