@@ -298,34 +298,35 @@ impl Background for Mirage {
 
     async fn run(self) -> eyre::Result<Self::Output> {
         let Self {
-            configure_state,
-            hydrate_state,
-            control_state,
+            configure,
+            hydrate,
+            control,
         } = self;
+
+        tracing::info!("starting mirage daemon");
 
         let mut thread_set = JoinSet::new();
 
-        let _ = thread_set.spawn(Background::run(configure_state));
-        let _ = thread_set.spawn(Background::run(hydrate_state));
-        let _ = thread_set.spawn(Background::run(control_state));
+        let _ = thread_set
+            .spawn(Background::run(configure).instrument(tracing::info_span!("configure")));
+        let _ = thread_set.spawn(Background::run(hydrate));
+        let _ = thread_set.spawn(Background::run(control).instrument(tracing::info_span!("control")));
 
         let mut terminate_signal = signal(SignalKind::terminate())?;
 
-        let target_value = 'a: {
+        'a: {
             tokio::select!(
                 // NOTE: The nest level of inner breakable blocks emitted by the macro is unknown, so the label is required.
                 Ok(..) = signal::ctrl_c() => break 'a Ok(()),
                 Some(..) = terminate_signal.recv() => break 'a Ok(()),
                 target_value = thread_set.join_all() => {
                     for target_value in target_value {
-                        let _ = target_value?;
+                        target_value?;
                     }
 
                     Ok(())
                 },
             )
-        };
-
-        target_value
+        }
     }
 }
