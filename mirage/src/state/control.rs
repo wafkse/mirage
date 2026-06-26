@@ -33,12 +33,12 @@ pub enum ControlRequest {
 
     /// A mutate message.
     ///
-    /// This forces override of the provided context value-tree on top of the already-established render context.
+    /// This deep-merges the provided TOML fragment on top of the already-established render context.
     ///
     /// This is ephemeral and does not persist across re-hydrate operations.
     Mutate {
-        /// The to mutate the source context with.
-        context: serde_json::Value,
+        /// The raw TOML fragment to deep-merge into the source context (e.g. `system.battery-state = "low"`).
+        expression: String,
     },
 
     /// A context message.
@@ -74,6 +74,26 @@ pub enum ControlResponse {
     },
 }
 
+/// Deep-merge an overlay value tree onto a base render context.
+///
+/// Tables merge recursively, while arrays and scalars replace wholesale. A type mismatch between corresponding keys also
+/// resolves in favour of the overlay.
+pub fn deep_merge(target_context: &mut toml::Value, override_context: toml::Value) {
+    match (target_context, override_context) {
+        (toml::Value::Table(target_table), toml::Value::Table(override_table)) => {
+            for (target_key, override_value) in override_table {
+                match target_table.get_mut(&target_key) {
+                    Some(target_value) => deep_merge(target_value, override_value),
+                    None => {
+                        let _ = target_table.insert(target_key, override_value);
+                    }
+                }
+            }
+        }
+        (target_context, override_context) => *target_context = override_context,
+    }
+}
+
 /// The control state.
 #[derive(Debug)]
 pub struct ControlState(UnixListener, ConfigurePipe);
@@ -86,33 +106,49 @@ impl ControlState {
     }
 
     /// Handle a control message.
-    async fn handle(
+    fn handle(
         ConfigurePipe(context_pipe, profile_pipe): &mut ConfigurePipe,
         target_request: ControlRequest,
     ) -> eyre::Result<ControlResponse> {
         match target_request {
-            ControlRequest::Ping => Ok::<_, eyre::Error>(ControlResponse::Pong),
+            ControlRequest::Ping => {
+                tracing::debug!("handling ping");
+
+                Ok::<_, eyre::Error>(ControlResponse::Pong)
+            }
             ControlRequest::Profile { name } => {
+                tracing::info!(profile = %name, "switching profile");
+
                 profile_pipe.send(name)?;
 
                 Ok(ControlResponse::Acknowledge)
             }
             ControlRequest::Hydrate => {
+                tracing::info!("forcing re-hydrate");
+
                 // NOTE: This fakes out a mutation, which triggers a re-hydrate without us having to re-create the context.
                 context_pipe.send_modify(|_| ());
 
                 Ok(ControlResponse::Acknowledge)
             }
-            ControlRequest::Mutate { context } => {
-                let override_context =
-                    tera::Context::from_value(context).map_err(eyre::Report::from)?;
+            ControlRequest::Mutate { expression } => {
+                tracing::info!(%expression, "mutating context");
 
-                context_pipe.send_modify(|target_context| target_context.extend(override_context));
+                // NOTE: Parse with `toml_edit` so dotted-key fragments and primitive typing are honoured.
+                let override_context =
+                    toml_edit::de::from_str::<toml::Value>(expression.as_str())
+                        .map_err(eyre::Report::from)?;
+
+                context_pipe
+                    .send_modify(|target_context| deep_merge(target_context, override_context));
 
                 Ok(ControlResponse::Acknowledge)
             }
             ControlRequest::Context => {
-                let context = context_pipe.borrow().clone().into_json();
+                tracing::debug!("dumping context");
+
+                // NOTE: The wire encoding is JSON; the internal model stays a `toml::Value`.
+                let context = serde_json::to_value(context_pipe.borrow().clone())?;
 
                 Ok(ControlResponse::Context { context })
             }
