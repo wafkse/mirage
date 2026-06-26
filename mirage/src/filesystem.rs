@@ -4,11 +4,40 @@
 
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::path::{Path, PathBuf};
+
+use eyre::WrapErr;
 
 use notify::Watcher;
 use notify::{Event, EventHandler, RecommendedWatcher};
 
 use tokio::sync::mpsc;
+
+/// Apply shell-style expansion to a path-bearing string.
+///
+/// Expand a leading `~` and `$VAR` or `${VAR}` environment references in a daemon path input.
+///
+/// # Errors
+///
+/// Returns an error when a referenced environment variable cannot be resolved.
+#[inline]
+pub fn shell_expand_str(target_path: &str) -> eyre::Result<String> {
+    shellexpand::full(target_path)
+        .map(std::borrow::Cow::into_owned)
+        .wrap_err_with(|| format!("could not expand path `{target_path}`"))
+}
+
+/// Apply shell-style expansion to the lossy UTF-8 representation of a path.
+///
+/// This is the [`Path`]-typed counterpart of [`shell_expand_str`], used for the daemon's `-C`/`-T`/`-L` inputs.
+///
+/// # Errors
+///
+/// Returns an error when a referenced environment variable cannot be resolved.
+#[inline]
+pub fn shell_expand(target_path: impl AsRef<Path>) -> eyre::Result<PathBuf> {
+    shell_expand_str(target_path.as_ref().to_string_lossy().as_ref()).map(PathBuf::from)
+}
 
 /// A platform watcher with a channel for successful filesystem events.
 ///
