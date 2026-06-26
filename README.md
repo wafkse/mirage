@@ -4,7 +4,7 @@ Mirage is a lightweight, asynchronous background daemon that orchestrates your d
 
 Managing a customized Linux desktop involves juggling overlapping design tokens: colors, fonts, borders and layout gaps, across tools that use entirely different configuration formats. Your terminal might use TOML, your window manager a custom syntax, your status bar JSON, and your app launcher CSS. Trying to keep these in sync usually means writing fragile `sed` scripts or adopting massive framework wrappers like Home Manager.
 
-Mirage solves this by completely separating your **data** from your **layout**. You define your variables in central TOML files, write your configurations as Tera templates, and let Mirage hydrate everything on the fly. 
+Mirage solves this by completely separating your **data** from your **layout**. You define your variables in central TOML files, write your configurations as minijinja templates, and let Mirage hydrate everything on the fly. 
 
 It acts as a reactive state engine for your filesystem.
 
@@ -22,9 +22,13 @@ Configure candidates are standard TOML files that contain your system's variable
 Mirage maintains an active filesystem watch on all loaded configure candidates. **If a single TOML candidate is modified, Mirage instantly recalculates the entire state tree and forces a complete re-render of all tracked templates.** This guarantees that your environment is never out of sync.
 
 ### Template Candidates
-Template candidates are the actual configuration files for your applications, written using Tera templating syntax. Mirage recursively watches the target directory defined in your manifest for these files.
+Template candidates are the actual configuration files for your applications, written using minijinja (Jinja2-compatible) templating syntax. Mirage recursively watches the target directory defined in your manifest for these files.
 
-Mirage identifies render targets by scanning for any file ending in a `.tera` extension. You write your configuration files exactly as you normally would, injecting Tera variables where needed (e.g., `{{ theme.base_color }}` or `{{ layout.gaps_in }}`).
+Mirage identifies render targets by scanning for any file ending in the configured template extension, `.jinja` by default. You write your configuration files exactly as you normally would, injecting variables where needed (e.g., `{{ theme.base_color }}` or `{{ layout.gaps_in }}`).
+
+The extension is configurable with the `template_extension` key under `[configure]` (set it to `"tera"` to migrate a legacy tree without renaming). Undefined references are a hard render error by default; the `undefined` key (`"strict"`, `"lenient"`, or `"chainable"`) relaxes this.
+
+Filesystem watchers emit several notifications for a single logical edit (a rename, a data write, a metadata touch). Mirage coalesces such a burst into one render by holding the pass back for a short grace period, configurable with the `notificate-period` key under `[configure]` (milliseconds, defaulting to `50`). Setting it to `0` renders eagerly on every notification.
 
 ## The Manifest: Bringing It Together
 
