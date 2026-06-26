@@ -147,8 +147,9 @@ Mirage is unopinionated power-user software. It delegates filesystem organizatio
 
 A teeny bit of personal recommendations:
 
-* You should add a negative `.gitignore` line to not include any non-Tera file into the untracked file pool if your dotfiles are being managed via Git: `!*.tera`. This keeps hydrated artifacts out of the repository.
-* Do not edit non-Tera hydrated files directly, any re-hydration will override all your changes. The template dictates all.
+* You should add a negative `.gitignore` line to not include any non-template file into the untracked file pool if your dotfiles are being managed via Git: `!*.jinja`. This keeps hydrated artifacts out of the repository.
+* Do not edit non-template hydrated files directly, any re-hydration will override all your changes. The template dictates all.
+* Mirage logs through `tracing`. It defaults to informational output; set the standard `RUST_LOG` environment variable (e.g. `RUST_LOG=mirage=debug`) to raise the verbosity, with per-subsystem spans (`configure`, `hydrate`, `control`) framing each event.
 
 # License
 
