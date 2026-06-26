@@ -104,13 +104,22 @@ When a re-render is triggered, Mirage evaluates *all* templates into a temporary
 
 Mirage does not use a separate "output" directory or a complex web of symlinks. It renders in-place.
 
-When processing `<filename>.<extension>.tera`, the compiled output is written directly adjacent to the source file as `<filename>.<extension>`. Mirage copies the original file permissions and applies the new file using an atomic `rename` syscall. 
+When processing `<filename>.<extension>.jinja`, the compiled output is written directly adjacent to the source file as `<filename>.<extension>`. Mirage copies the original file permissions and applies the new file using an atomic `rename` syscall. 
 
 Because the replacement is atomic, external applications watching those files via `inotify` will never read a partial write or an empty file.
 
+### One-Shot Rendering
+
+Some workflows want a single hydration pass rather than a resident daemon: a login script, a `Makefile` target, or a `git` hook. Passing `--oneshot` folds the manifest, renders every template once under the same all-or-nothing contract, and exits without starting the daemon, binding the control socket, or establishing any filesystem watch.
+
+```bash
+# Render the manifest once and exit
+mirage --oneshot -C ~/.config/mirage
+```
+
 ### Deferred Side-Effects
 
-Certain applications require a Unix signal or shell command to reload their configuration. To support this, Mirage allows templates to register post-hydration shell commands via custom Tera functions. 
+Certain applications require a Unix signal or shell command to reload their configuration. To support this, Mirage allows templates to register post-hydration shell commands via custom template functions. 
 
 To prevent race conditions, these functions do not execute immediately when the template is evaluated. Instead, they append commands to an internal queue. Mirage flushes and executes this side-effect queue only *after* the atomic rename phase successfully commits. The application is never instructed to reload before its configuration is safely written to disk.
 
