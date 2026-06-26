@@ -18,22 +18,65 @@ use crate::{
     manifest::{self, ManifestCandidate},
 };
 
+/// Fold the configure candidate tree into a single render context under the selected profile.
+///
+/// Each manifest candidate is expanded against the candidate root, the resulting files are combined under their merge
+/// policies, the `MIRAGE_`-prefixed environment overlays are merged, and the chosen profile is selected out. Both the
+/// daemon's reactive `ConfigureState` and the synchronous one-shot render funnel through this so the two paths can never
+/// drift apart.
+///
+/// # Errors
+///
+/// Returns an error when a candidate path cannot be expanded or globbed, or when the folded tree fails to deserialize.
+pub(crate) fn fold_context(
+    candidate_tree: &Path,
+    manifest_candidates: &[ManifestCandidate],
+    context_profile: &Profile,
+) -> eyre::Result<toml::Value> {
+    let mut configure_list = Vec::new();
+
+    for target_value in manifest_candidates
+        .iter()
+        .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
+    {
+        configure_list.extend(target_value?);
+    }
+
+    tracing::debug!(
+        candidate_count = configure_list.len(),
+        profile = %context_profile,
+        "folding configure candidates",
+    );
+
+    let target_context = configure_list
+        .iter()
+        .fold(Figment::new(), |target_value: Figment, target_candidate| {
+            target_candidate.combine::<manifest::DefaultFormat>(target_value)
+        })
+        .merge(Env::prefixed("MIRAGE_"))
+        .select(context_profile.clone())
+        .extract::<toml::Value>()?;
+
+    Ok(target_context)
+}
+
 /// The configure pipe of a [`ConfigureState`].
 #[derive(Debug, Clone)]
-pub struct ConfigurePipe(pub watch::Sender<tera::Context>, pub watch::Sender<Profile>);
+pub struct ConfigurePipe(pub watch::Sender<toml::Value>, pub watch::Sender<Profile>);
 
 impl ConfigurePipe {
-    /// Determine the send half for the Tera context.
+    /// Determine the send half for the render context.
     #[inline]
-    pub const fn context(&self) -> &watch::Sender<tera::Context> {
+    #[must_use]
+    pub const fn context(&self) -> &watch::Sender<toml::Value> {
         let Self(target_value, ..) = self;
 
         target_value
     }
 
-    /// Determine the send half for the Tera context, mutably.
+    /// Determine the send half for the render context, mutably.
     #[inline]
-    pub const fn context_mut(&mut self) -> &mut watch::Sender<tera::Context> {
+    pub const fn context_mut(&mut self) -> &mut watch::Sender<toml::Value> {
         let Self(target_value, ..) = self;
 
         target_value
@@ -41,6 +84,7 @@ impl ConfigurePipe {
 
     /// Determine the send half for the selected profile.
     #[inline]
+    #[must_use]
     pub const fn profile(&self) -> &watch::Sender<Profile> {
         let Self(.., target_value) = self;
 
@@ -78,6 +122,10 @@ pub struct ConfigureState {
 
 impl ConfigureState {
     /// Instantiate a [`ConfigureState`] with the target configure candidate list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the candidate tree cannot be watched or the initial context fails to fold.
     #[inline]
     pub fn new(
         (candidate_tree, manifest_candidates): (&Path, Vec<ManifestCandidate>),
@@ -91,30 +139,8 @@ impl ConfigureState {
             target_value
         };
 
-        let configure_list = {
-            let mut target_list = Vec::new();
-
-            for target_value in manifest_candidates
-                .iter()
-                .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
-            {
-                let target_value = target_value?;
-
-                target_list.extend(target_value);
-            }
-
-            target_list
-        };
-
-        let target_context = configure_list
-            .iter()
-            .fold(Figment::new(), |target_value: Figment, target_candidate| {
-                target_candidate.combine::<manifest::DefaultFormat>(target_value)
-            })
-            .merge(Env::prefixed("MIRAGE_"))
-            .select(context_profile.clone())
-            .extract::<toml::Value>()
-            .map(tera::Context::from_serialize)??;
+        let target_context =
+            fold_context(candidate_tree, &manifest_candidates, &context_profile)?;
 
         let (context_sender, ..) = watch::channel(target_context);
 
@@ -134,6 +160,7 @@ impl ConfigureState {
 
     /// Determine the watched pipe pair.
     #[inline]
+    #[must_use]
     pub const fn pipe(&self) -> &ConfigurePipe {
         let Self { configure_pipe, .. } = self;
 
