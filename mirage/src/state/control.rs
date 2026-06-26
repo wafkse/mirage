@@ -160,13 +160,6 @@ impl Background for ControlState {
     type Output = ();
 
     async fn run(mut self) -> eyre::Result<Self::Output> {
-        let Self(ref mut target_endpoint, ref mut target_pipe) = self;
-
-        let (ref state_send, mut state_recv) = mpsc::unbounded_channel::<(
-            ControlRequest,
-            oneshot::Sender<eyre::Result<ControlResponse>>,
-        )>();
-
         enum Operation {
             Socket(UnixStream),
             Request(
@@ -176,6 +169,13 @@ impl Background for ControlState {
                 ),
             ),
         }
+
+        let Self(ref mut target_endpoint, ref mut target_pipe) = self;
+
+        let (ref state_send, mut state_recv) = mpsc::unbounded_channel::<(
+            ControlRequest,
+            oneshot::Sender<eyre::Result<ControlResponse>>,
+        )>();
 
         loop {
             let target_operate = tokio::select!(
@@ -215,7 +215,7 @@ impl Background for ControlState {
                                 Err(target_error) => Err(target_error),
                             };
 
-                            let ref target_response = match target_response {
+                            let target_response = &match target_response {
                                 Ok(target_value) => target_value,
                                 Err(target_error) => ControlResponse::Error {
                                     message: target_error.to_string(),
@@ -233,11 +233,7 @@ impl Background for ControlState {
                     tokio::spawn(target_handle);
                 }
                 Operation::Request((target_message, target_channel)) => {
-                    let _ = target_channel.send(
-                        ControlState::handle(target_pipe, target_message)
-                            .await
-                            .map_err(eyre::Report::from),
-                    );
+                    let _ = target_channel.send(ControlState::handle(target_pipe, target_message));
                 }
             }
         }
@@ -257,5 +253,53 @@ impl Drop for ControlState {
         {
             let _ = std::fs::remove_file(local_file);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deep_merge;
+
+    #[test]
+    fn tables_merge_while_arrays_and_scalars_replace() {
+        let mut target_context = toml::from_str::<toml::Value>(
+            "[system]\nbattery = \"full\"\nload = 1\ntags = [\"a\"]\n",
+        )
+        .unwrap();
+
+        let override_context =
+            toml::from_str::<toml::Value>("[system]\nbattery = \"low\"\ntags = [\"b\", \"c\"]\n")
+                .unwrap();
+
+        deep_merge(&mut target_context, override_context);
+
+        let target_system = target_context.get("system").unwrap();
+
+        // The overlaid scalar replaces, the untouched scalar survives, and the array replaces wholesale.
+        assert_eq!(target_system.get("battery").unwrap().as_str(), Some("low"));
+        assert_eq!(target_system.get("load").unwrap().as_integer(), Some(1));
+        assert_eq!(
+            target_system.get("tags").unwrap().as_array().map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn dotted_fragment_parses_and_merges() {
+        let mut target_context =
+            toml::from_str::<toml::Value>("[system]\nbattery = \"full\"\n").unwrap();
+
+        let override_context =
+            toml_edit::de::from_str::<toml::Value>("system.battery-state = \"low\"").unwrap();
+
+        deep_merge(&mut target_context, override_context);
+
+        let target_system = target_context.get("system").unwrap();
+
+        assert_eq!(target_system.get("battery").unwrap().as_str(), Some("full"));
+        assert_eq!(
+            target_system.get("battery-state").unwrap().as_str(),
+            Some("low")
+        );
     }
 }
