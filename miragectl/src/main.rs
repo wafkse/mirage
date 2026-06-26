@@ -79,15 +79,13 @@ async fn main() -> eyre::Result<()> {
         LengthDelimitedCodec::new(),
     );
 
-    let ref control_request = match control_command {
+    let control_request = &match control_command {
         ControlCommand::Ping => ControlRequest::Ping,
         ControlCommand::Hydrate => ControlRequest::Hydrate,
         ControlCommand::Profile { name } => ControlRequest::Profile {
             name: figment::Profile::from(name),
         },
-        ControlCommand::Mutate { value } => ControlRequest::Mutate {
-            context: serde_json::from_str(value.as_str())?,
-        },
+        ControlCommand::Mutate { value } => ControlRequest::Mutate { expression: value },
         ControlCommand::Context => ControlRequest::Context,
     };
 
