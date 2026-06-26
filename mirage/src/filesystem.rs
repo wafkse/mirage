@@ -47,13 +47,23 @@ pub fn shell_expand(target_path: impl AsRef<Path>) -> eyre::Result<PathBuf> {
 pub struct FsWatcher(mpsc::UnboundedReceiver<Event>, RecommendedWatcher);
 
 impl FsWatcher {
-    /// Construct a filesystem watcher using [`notify::Config::default`].
+    /// Instantiate the standard configuration for this filesystem watcher.
+    ///
+    /// Uses [`notify::Config::default`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying platform watcher cannot be constructed.
     #[inline]
     pub fn standard() -> eyre::Result<Self> {
         Self::configured(notify::Config::default())
     }
 
     /// Instantiate a filesystem watcher with the provided configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying platform watcher cannot be constructed.
     #[inline]
     pub fn configured(target_configure: notify::Config) -> eyre::Result<Self> {
         let (channel_send, channel_recv) = mpsc::unbounded_channel();
@@ -68,6 +78,7 @@ impl FsWatcher {
 impl FsWatcher {
     /// Borrow the `mpsc` receiver attached for this filesystem watcher.
     #[inline]
+    #[must_use]
     pub const fn receiver(&self) -> &mpsc::UnboundedReceiver<Event> {
         let Self(target_recv, ..) = self;
 
@@ -116,7 +127,7 @@ impl EventHandler for FsEventForwarder {
         if let Ok(target_event) = target_event {
             let Self(channel_send) = self;
 
-            let _ = channel_send
+            channel_send
                 .send(target_event)
                 .expect("failed to send filesystem event");
         }
