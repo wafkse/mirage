@@ -62,6 +62,24 @@ Mirage utilizes the `figment` configuration library under the hood. When it proc
 * **`fallback`**: The candidate only provides values for keys that have not already been defined by an earlier candidate.
 * **`supplement`**: Similar to fallback, but applies specifically to appending arrays without overriding existing entries.
 
+## Scripting with Luau
+
+Mirage ships no template functions of its own. Every template function and filter is authored in Luau and supplied per deployment by a module the manifest points at via the `module` key under `[configure]` (resolved relative to the configure root, mirroring `require`).
+
+The module returns a table of what it exports:
+
+```lua
+return {
+    functions = { upper = function(value) return tostring(value):upper() end },
+    filters   = { shout = function(value) return tostring(value) .. "!" end },
+    globals   = { brand = "MIRAGE" },
+}
+```
+
+`functions` and `filters` become template functions and filters under their keys, and `globals` become constant template globals. Module code receives template values as opaque, lazily-resolving handles: indexing walks the underlying value tree (`value.a.b[1]`) without materializing it, and `:kind()`, `:is_undefined()`, `:is_none()`, `:get(key)`, and `:to_lua()` are available for inspection. A change to module code rebuilds the VM and forces a full re-render.
+
+The Luau VM and the rendering engine live on a dedicated hydration worker with its own runtime. On top of the vanilla Luau standard library, Mirage exposes its own modules under the `@mirage/<lib>` require convention, each gated by an explicit `[module].libraries` allowlist. Module functions may be asynchronous — for example, with `@mirage/time` allowlisted, `require("@mirage/time").sleep(seconds)` can be `await`ed and the worker drives it to completion within the otherwise-synchronous render. A module evaluation error aborts the render pass under the same all-or-nothing contract as a template error.
+
 ## Profile & Variable Semantics
 
 Inside your TOML configure candidates, variables are organized into tables. Mirage treats these top-level tables as **Profiles**, which allows you to define conditional states (like a "powersave" mode or a "dark" theme) alongside your base configurations.
