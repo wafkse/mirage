@@ -11,6 +11,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -31,7 +32,7 @@ use crate::manifest::ManifestModule;
 /// Conversion returns an error when a table reaches this depth.
 const MAX_TABLE_DEPTH: usize = 128;
 
-/// Exports from `functions`, `filters`, and `globals`, grouped for registration.
+/// Exports from `function_table`, `filter_table`, and `environment_table`, grouped for registration.
 type ModuleExports = (
     Vec<(String, mlua::Function)>,
     Vec<(String, mlua::Function)>,
@@ -42,26 +43,33 @@ type ModuleExports = (
 ///
 /// Defined arguments passed to a module function or filter use this wrapper. Indexing resolves
 /// the requested child lazily and preserves `MiniJinja`'s zero-based sequence indices. The methods
-/// `kind`, `get`, `is_undefined`, `is_none`, and `to_lua` take precedence over data keys. Use
+/// `kind`, `get`, `undefined`, `none`, and `materialize` take precedence over data keys. Use
 /// `value:get(key)` to reach a key that shares a method name.
 #[derive(Debug, Clone)]
 pub struct MirageValue(pub minijinja::Value);
 
 impl UserData for MirageValue {
     fn add_methods<M: UserDataMethods<Self>>(target_methods: &mut M) {
-        target_methods.add_meta_method(MetaMethod::Index, |target_lua, target_self, key: mlua::Value| {
-            if let mlua::Value::String(ref method_name) = key
-                && let Ok(method_name) = method_name.to_str()
-                && matches!(
-                    method_name.as_ref(),
-                    "kind" | "get" | "is_undefined" | "is_none" | "to_lua"
-                )
-            {
-                return reserved_method(target_lua, target_self.0.clone(), method_name.as_ref());
-            }
+        target_methods.add_meta_method(
+            MetaMethod::Index,
+            |target_lua, target_self, key: mlua::Value| {
+                if let mlua::Value::String(ref method_name) = key
+                    && let Ok(method_name) = method_name.to_str()
+                    && matches!(
+                        method_name.as_ref(),
+                        "kind" | "get" | "undefined" | "none" | "materialize"
+                    )
+                {
+                    return reserved_method(
+                        target_lua,
+                        target_self.0.clone(),
+                        method_name.as_ref(),
+                    );
+                }
 
-            data_index(target_lua, &target_self.0, &key)
-        });
+                data_index(target_lua, &target_self.0, &key)
+            },
+        );
 
         target_methods.add_meta_method(MetaMethod::Len, |_, target_self, ()| {
             target_self
@@ -91,18 +99,20 @@ impl UserData for MirageValue {
 
             let cursor = std::cell::Cell::new(0_usize);
 
-            let target_iterator =
-                target_lua.create_function(move |target_lua, (): ()| {
-                    let position = cursor.get();
+            let target_iterator = target_lua.create_function(move |target_lua, (): ()| {
+                let position = cursor.get();
 
-                    let Some((target_key, target_value)) = snapshot.get(position) else {
-                        return Ok((mlua::Value::Nil, mlua::Value::Nil));
-                    };
+                let Some((target_key, target_value)) = snapshot.get(position) else {
+                    return Ok((mlua::Value::Nil, mlua::Value::Nil));
+                };
 
-                    cursor.set(position + 1);
+                cursor.set(position + 1);
 
-                    Ok((target_key.clone(), MirageValue(target_value.clone()).into_lua(target_lua)?))
-                })?;
+                Ok((
+                    target_key.clone(),
+                    MirageValue(target_value.clone()).into_lua(target_lua)?,
+                ))
+            })?;
 
             Ok((target_iterator, mlua::Value::Nil, mlua::Value::Nil))
         });
@@ -124,25 +134,22 @@ fn reserved_method(
 
             target_lua.create_function(move |_, (): ()| Ok(target_value.clone()))
         }
-        "is_undefined" => {
+        "undefined" => {
             let target_state = target_value.is_undefined();
 
             target_lua.create_function(move |_, (): ()| Ok(target_state))
         }
-        "is_none" => {
+        "none" => {
             let target_state = target_value.is_none();
 
             target_lua.create_function(move |_, (): ()| Ok(target_state))
         }
-        "to_lua" => target_lua.create_function(move |target_lua, (): ()| {
-            minijinja_to_lua(target_lua, &target_value)
-        }),
+        "materialize" => target_lua
+            .create_function(move |target_lua, (): ()| minijinja_to_lua(target_lua, &target_value)),
         // NOTE: `get` reaches data keys that share a reserved method name.
-        _ => target_lua.create_function(
-            move |target_lua, (_, key): (mlua::Value, mlua::Value)| {
-                data_index(target_lua, &target_value, &key)
-            },
-        ),
+        _ => target_lua.create_function(move |target_lua, (_, key): (mlua::Value, mlua::Value)| {
+            data_index(target_lua, &target_value, &key)
+        }),
     }?;
 
     target_function.into_lua(target_lua)
@@ -151,8 +158,8 @@ fn reserved_method(
 /// Perform a data lookup against a [`minijinja::Value`], mapping a missing reference to Lua `nil`.
 ///
 /// String keys resolve attributes and integer keys resolve items using `MiniJinja`'s indices.
-/// Unsupported keys and undefined results yield `nil`. A `is_none` value retains its [`MirageValue`]
-/// wrapper and can be tested with `:is_none()`.
+/// Unsupported keys and undefined results yield `nil`. A `none` value retains its [`MirageValue`]
+/// wrapper and can be tested with `:none()`.
 fn data_index(
     target_lua: &Lua,
     target_value: &minijinja::Value,
@@ -231,7 +238,9 @@ fn minijinja_key_to_lua(
     if let Some(target_integer) = target_key.as_i64() {
         Ok(mlua::Value::Integer(target_integer))
     } else if let Some(target_string) = target_key.as_str() {
-        target_lua.create_string(target_string).map(mlua::Value::String)
+        target_lua
+            .create_string(target_string)
+            .map(mlua::Value::String)
     } else {
         target_lua
             .create_string(target_key.to_string())
@@ -239,11 +248,14 @@ fn minijinja_key_to_lua(
     }
 }
 
-/// Deeply convert a [`minijinja::Value`] into native Lua values, backing the `:to_lua()` reserved method.
+/// Deeply convert a [`minijinja::Value`] into native Lua values, backing the `:materialize()` reserved method.
 ///
-/// Sequences become one-based tables and maps retain their converted keys. Undefined and `is_none`
+/// Sequences become one-based tables and maps retain their converted keys. Undefined and `none`
 /// values become `nil`. Unsupported `MiniJinja` value kinds produce an error.
-fn minijinja_to_lua(target_lua: &Lua, target_value: &minijinja::Value) -> mlua::Result<mlua::Value> {
+fn minijinja_to_lua(
+    target_lua: &Lua,
+    target_value: &minijinja::Value,
+) -> mlua::Result<mlua::Value> {
     use minijinja::value::ValueKind;
 
     match target_value.kind() {
@@ -331,9 +343,12 @@ pub fn toml_to_minijinja(target_value: &toml::Value) -> minijinja::Value {
         toml::Value::Float(target_value) => minijinja::Value::from(*target_value),
         toml::Value::Boolean(target_value) => minijinja::Value::from(*target_value),
         toml::Value::Datetime(target_value) => minijinja::Value::from(target_value.to_string()),
-        toml::Value::Array(target_list) => {
-            minijinja::Value::from(target_list.iter().map(toml_to_minijinja).collect::<Vec<_>>())
-        }
+        toml::Value::Array(target_list) => minijinja::Value::from(
+            target_list
+                .iter()
+                .map(toml_to_minijinja)
+                .collect::<Vec<_>>(),
+        ),
         toml::Value::Table(target_table) => target_table
             .iter()
             .map(|(target_key, target_value)| (target_key.clone(), toml_to_minijinja(target_value)))
@@ -377,9 +392,13 @@ fn convert_value(
         mlua::Value::Table(target_table) => convert_table(&target_table, depth, visited),
         mlua::Value::UserData(target_userdata) => {
             if let Ok(target_value) = target_userdata.borrow::<MirageValue>() {
-                Ok(target_value.0.clone())
+                let &MirageValue(ref target_value) = target_value.deref();
+
+                Ok(target_value.clone())
             } else {
-                Err(render_error("foreign userdata cannot be converted to a value"))
+                Err(render_error(
+                    "foreign userdata cannot be converted to a value",
+                ))
             }
         }
         mlua::Value::Function(..) => Err(render_error(
@@ -407,7 +426,9 @@ fn convert_table(
     let identity = target_table.to_pointer();
 
     if !visited.insert(identity) {
-        return Err(render_error("a cyclic table cannot be converted to a value"));
+        return Err(render_error(
+            "a cyclic table cannot be converted to a value",
+        ));
     }
 
     let mut entries = Vec::new();
@@ -502,13 +523,18 @@ fn invoke(
 ) -> Result<minijinja::Value, Error> {
     let mut lua_args: Vec<Option<MirageValue>> = Vec::with_capacity(target_args.len() + 1);
 
-    lua_args.extend(piped_value.into_iter().chain(target_args).map(|target_value| {
-        if target_value.is_undefined() {
-            None
-        } else {
-            Some(MirageValue(target_value))
-        }
-    }));
+    lua_args.extend(
+        piped_value
+            .into_iter()
+            .chain(target_args)
+            .map(|target_value| {
+                if target_value.is_undefined() {
+                    None
+                } else {
+                    Some(MirageValue(target_value))
+                }
+            }),
+    );
 
     // NOTE: Rendering starts after the event wait's `block_on` has finished.
     let target_return = target_runtime
@@ -545,14 +571,14 @@ pub struct LuaRuntime {
     /// The Luau virtual machine. Held to keep the extracted callables alive.
     _target_lua: Lua,
 
-    /// Functions exported through `functions` and registered with [`Environment::add_function`].
-    target_functions: Vec<(String, mlua::Function)>,
+    /// Functions exported through `function_table` and registered with [`Environment::add_function`].
+    target_function_table: Vec<(String, mlua::Function)>,
 
-    /// Filters exported through `filters` and registered with [`Environment::add_filter`].
-    target_filters: Vec<(String, mlua::Function)>,
+    /// Filters exported through `filter_table` and registered with [`Environment::add_filter`].
+    target_filter_table: Vec<(String, mlua::Function)>,
 
-    /// Globals exported through `globals` and registered with [`Environment::add_global`].
-    target_globals: Vec<(String, minijinja::Value)>,
+    /// Globals exported through `environment_table` and registered with [`Environment::add_global`].
+    target_environment_table: Vec<(String, minijinja::Value)>,
 }
 
 impl LuaRuntime {
@@ -605,13 +631,14 @@ impl LuaRuntime {
 
         let module_value = target_require.call::<mlua::Value>(module_spec)?;
 
-        let (target_functions, target_filters, target_globals) = extract_exports(&module_value)?;
+        let (target_function_table, target_filter_table, target_environment_table) =
+            extract_exports(&module_value)?;
 
         Ok(Self {
             _target_lua: target_lua,
-            target_functions,
-            target_filters,
-            target_globals,
+            target_function_table,
+            target_filter_table,
+            target_environment_table,
         })
     }
 
@@ -624,15 +651,19 @@ impl LuaRuntime {
     ///
     /// A registered callable panics if invoked from within an active Tokio runtime.
     #[inline]
-    pub fn register(&self, target_environment: &mut Environment<'static>, target_runtime: &Arc<Runtime>) {
+    pub fn register(
+        &self,
+        target_environment: &mut Environment<'static>,
+        target_runtime: &Arc<Runtime>,
+    ) {
         let Self {
-            target_functions,
-            target_filters,
-            target_globals,
+            target_function_table,
+            target_filter_table,
+            target_environment_table,
             ..
         } = self;
 
-        for (target_name, target_function) in target_functions {
+        for (target_name, target_function) in target_function_table {
             let target_function = target_function.clone();
 
             let target_runtime = Arc::clone(target_runtime);
@@ -645,7 +676,7 @@ impl LuaRuntime {
             );
         }
 
-        for (target_name, target_function) in target_filters {
+        for (target_name, target_function) in target_filter_table {
             let target_function = target_function.clone();
 
             let target_runtime = Arc::clone(target_runtime);
@@ -653,52 +684,61 @@ impl LuaRuntime {
             target_environment.add_filter(
                 target_name.clone(),
                 move |target_value: minijinja::Value, target_args: Rest<minijinja::Value>| {
-                    invoke(&target_runtime, &target_function, Some(target_value), target_args.0)
+                    invoke(
+                        &target_runtime,
+                        &target_function,
+                        Some(target_value),
+                        target_args.0,
+                    )
                 },
             );
         }
 
-        for (target_name, target_value) in target_globals {
+        for (target_name, target_value) in target_environment_table {
             target_environment.add_global(target_name.clone(), target_value.clone());
         }
     }
 }
 
-/// Extract the `functions`, `filters`, and `globals` tables from an evaluated module value.
+/// Extract the `function_table`, `filter_table`, and `environment_table` tables from an evaluated module value.
 ///
 /// A non-table module value yields empty exports. Missing export tables yield empty registrations
 /// for that category. Unknown top-level keys are ignored.
 fn extract_exports(module_value: &mlua::Value) -> eyre::Result<ModuleExports> {
-    let mut target_functions = Vec::new();
-    let mut target_filters = Vec::new();
-    let mut target_globals = Vec::new();
+    let mut target_function_table = Vec::new();
+    let mut target_filter_table = Vec::new();
+    let mut target_environment_table = Vec::new();
 
     if let mlua::Value::Table(module_table) = module_value {
-        if let Some(target_table) = module_table.get::<Option<mlua::Table>>("functions")? {
+        if let Some(target_table) = module_table.get::<Option<mlua::Table>>("function_table")? {
             for target_pair in target_table.pairs::<String, mlua::Function>() {
-                target_functions.push(target_pair?);
+                target_function_table.push(target_pair?);
             }
         }
 
-        if let Some(target_table) = module_table.get::<Option<mlua::Table>>("filters")? {
+        if let Some(target_table) = module_table.get::<Option<mlua::Table>>("filter_table")? {
             for target_pair in target_table.pairs::<String, mlua::Function>() {
-                target_filters.push(target_pair?);
+                target_filter_table.push(target_pair?);
             }
         }
 
-        if let Some(target_table) = module_table.get::<Option<mlua::Table>>("globals")? {
+        if let Some(target_table) = module_table.get::<Option<mlua::Table>>("environment_table")? {
             for target_pair in target_table.pairs::<String, mlua::Value>() {
                 let (target_name, target_value) = target_pair?;
 
-                let target_value =
-                    lua_to_minijinja(target_value).map_err(|target_error| eyre!("{target_error}"))?;
+                let target_value = lua_to_minijinja(target_value)
+                    .map_err(|target_error| eyre!("{target_error}"))?;
 
-                target_globals.push((target_name, target_value));
+                target_environment_table.push((target_name, target_value));
             }
         }
     }
 
-    Ok((target_functions, target_filters, target_globals))
+    Ok((
+        target_function_table,
+        target_filter_table,
+        target_environment_table,
+    ))
 }
 
 /// The host `require` implementation, shared by the top-level module load and in-module requires.
@@ -792,7 +832,10 @@ fn require_mirage(
     require_libraries: &[String],
     target_library: &str,
 ) -> mlua::Result<mlua::Value> {
-    if !require_libraries.iter().any(|allowed| allowed == target_library) {
+    if !require_libraries
+        .iter()
+        .any(|allowed| allowed == target_library)
+    {
         return Err(mlua::Error::runtime(format!(
             "`@mirage/{target_library}` is not permitted by the [module].libraries allowlist"
         )));
@@ -828,7 +871,10 @@ fn require_mirage(
 /// Build a Mirage host library by name.
 ///
 /// Returns [`None`] for an unknown library.
-fn build_mirage_module(target_lua: &Lua, target_library: &str) -> Option<mlua::Result<mlua::Table>> {
+fn build_mirage_module(
+    target_lua: &Lua,
+    target_library: &str,
+) -> Option<mlua::Result<mlua::Table>> {
     match target_library {
         "time" => Some(build_time_module(target_lua)),
         _ => None,
@@ -933,7 +979,9 @@ mod tests {
             minijinja::Value::from(true)
         );
 
-        let target_datetime = "1979-05-27T07:32:00Z".parse::<toml::value::Datetime>().unwrap();
+        let target_datetime = "1979-05-27T07:32:00Z"
+            .parse::<toml::value::Datetime>()
+            .unwrap();
 
         assert_eq!(
             toml_to_minijinja(&toml::Value::Datetime(target_datetime)),
@@ -1045,18 +1093,21 @@ mod tests {
     }
 
     #[test]
-    fn module_functions_and_globals_register() {
+    fn module_function_table_and_environment_table_register() {
         let target_dir = tempfile::tempdir().unwrap();
 
         std::fs::write(
             target_dir.path().join("mod.luau"),
-            "return {\n  functions = { shout = function(target) return tostring(target):upper() end },\n  globals = { brand = \"MIRAGE\" },\n}\n",
+            "return {\n  function_table = { shout = function(target) return tostring(target):upper() end },\n  environment_table = { brand = \"MIRAGE\" },\n}\n",
         )
         .unwrap();
 
-        let target_runtime =
-            LuaRuntime::load(target_dir.path(), Path::new("mod.luau"), &ManifestModule::default())
-                .unwrap();
+        let target_runtime = LuaRuntime::load(
+            target_dir.path(),
+            Path::new("mod.luau"),
+            &ManifestModule::default(),
+        )
+        .unwrap();
 
         let mut target_environment = Environment::new();
 
@@ -1081,7 +1132,7 @@ mod tests {
 
         std::fs::write(
             target_dir.path().join("mod.luau"),
-            "local time = require(\"@mirage/time\")\nreturn {\n  functions = { slow = function(target) time.sleep(0.01) return tostring(target):upper() end },\n}\n",
+            "local time = require(\"@mirage/time\")\nreturn {\n  function_table = { slow = function(target) time.sleep(0.01) return tostring(target):upper() end },\n}\n",
         )
         .unwrap();
 
@@ -1096,7 +1147,9 @@ mod tests {
 
         target_module.register(&mut target_environment, &block_runtime());
 
-        target_environment.add_template("t", "{{ slow(name) }}").unwrap();
+        target_environment
+            .add_template("t", "{{ slow(name) }}")
+            .unwrap();
 
         let target_output = target_environment
             .get_template("t")
@@ -1117,21 +1170,30 @@ mod tests {
 
         std::fs::write(
             module_root.join("index.luau"),
-            "local helper = require(\"helper\")\nreturn { globals = { greeting = helper.hello } }\n",
+            "local helper = require(\"helper\")\nreturn { environment_table = { greeting = helper.hello } }\n",
         )
         .unwrap();
 
-        std::fs::write(module_root.join("helper.luau"), "return { hello = \"hey\" }\n").unwrap();
+        std::fs::write(
+            module_root.join("helper.luau"),
+            "return { hello = \"hey\" }\n",
+        )
+        .unwrap();
 
-        let target_runtime =
-            LuaRuntime::load(target_dir.path(), Path::new("mymod"), &ManifestModule::default())
-                .unwrap();
+        let target_runtime = LuaRuntime::load(
+            target_dir.path(),
+            Path::new("mymod"),
+            &ManifestModule::default(),
+        )
+        .unwrap();
 
         let mut target_environment = Environment::new();
 
         target_runtime.register(&mut target_environment, &block_runtime());
 
-        target_environment.add_template("t", "{{ greeting }}").unwrap();
+        target_environment
+            .add_template("t", "{{ greeting }}")
+            .unwrap();
 
         assert_eq!(
             target_environment
@@ -1153,9 +1215,12 @@ mod tests {
         )
         .unwrap();
 
-        let target_error =
-            LuaRuntime::load(target_dir.path(), Path::new("mod.luau"), &ManifestModule::default())
-                .unwrap_err();
+        let target_error = LuaRuntime::load(
+            target_dir.path(),
+            Path::new("mod.luau"),
+            &ManifestModule::default(),
+        )
+        .unwrap_err();
 
         assert!(target_error.to_string().contains("not permitted"));
     }

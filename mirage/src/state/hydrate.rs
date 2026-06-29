@@ -112,10 +112,7 @@ impl HydrationState {
         notificate_period: Duration,
         module_source: Option<ModuleSource>,
     ) -> eyre::Result<Self> {
-        let lua_runtime = module_source
-            .as_ref()
-            .map(ModuleSource::load)
-            .transpose()?;
+        let lua_runtime = module_source.as_ref().map(ModuleSource::load).transpose()?;
 
         let mut watcher_template = FsWatcher::standard()?;
 
@@ -126,8 +123,10 @@ impl HydrationState {
             .map(|target_source| -> eyre::Result<FsWatcher> {
                 let mut target_watch = FsWatcher::standard()?;
 
-                target_watch
-                    .watch(target_source.configure_root.as_path(), RecursiveMode::Recursive)?;
+                target_watch.watch(
+                    target_source.configure_root.as_path(),
+                    RecursiveMode::Recursive,
+                )?;
 
                 Ok(target_watch)
             })
@@ -213,7 +212,11 @@ impl HydrationState {
 
                     while let Ok(extra_event) = tokio::time::timeout(
                         notificate_period,
-                        next_event(&mut watcher_template, &mut watcher_module, &mut context_pipe),
+                        next_event(
+                            &mut watcher_template,
+                            &mut watcher_module,
+                            &mut context_pipe,
+                        ),
                     )
                     .await
                     {
@@ -422,7 +425,10 @@ fn safe_join(template_root: &Path, target_name: &str) -> Option<PathBuf> {
 fn template_names(template_root: &Path, template_extension: &str) -> eyre::Result<Vec<String>> {
     let mut target_list = Vec::new();
 
-    for target_entry in WalkDir::new(template_root).into_iter().filter_map(Result::ok) {
+    for target_entry in WalkDir::new(template_root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         if !target_entry.file_type().is_file() {
             continue;
         }
@@ -588,7 +594,11 @@ mod tests {
         let target_dir = tempfile::tempdir().unwrap();
 
         std::fs::create_dir(target_dir.path().join(".config")).unwrap();
-        std::fs::write(target_dir.path().join(".config/app.conf.jinja"), "from-dot-folder").unwrap();
+        std::fs::write(
+            target_dir.path().join(".config/app.conf.jinja"),
+            "from-dot-folder",
+        )
+        .unwrap();
         std::fs::write(target_dir.path().join(".bashrc.jinja"), "from-dotfile").unwrap();
 
         let mut target_environment = Environment::new();
