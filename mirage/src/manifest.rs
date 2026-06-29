@@ -53,20 +53,21 @@ pub struct ManifestConfigure {
     pub template: Option<PathBuf>,
 
     /// The path to the daemon control socket.
+    #[serde(rename = "listen-sock", skip_serializing_if = "Option::is_none")]
     pub listen_sock: Option<PathBuf>,
 
     /// The profile to use by default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
 
-    /// The path to the Luau module supplying template functions and filters.
+    /// The path to the Luau module supplying template function_table and filter_table.
     ///
     /// This is resolved relative to the configure root after shell expansion, mirroring `require` resolution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module: Option<PathBuf>,
 
     /// The extension borne by template candidates, defaulting to [`DEFAULT_TEMPLATE_EXTENSION`].
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "template-extension", skip_serializing_if = "Option::is_none")]
     pub template_extension: Option<String>,
 
     /// The undefined-reference behaviour for the rendering engine.
