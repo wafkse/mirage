@@ -606,6 +606,9 @@ impl LuaRuntime {
     ) -> eyre::Result<Self> {
         let target_lua = Lua::new();
 
+        // NOTE: Use native codegen for Luau.
+        target_lua.enable_jit(true);
+
         let require_jail = configure_root.as_ref().canonicalize()?;
 
         let require_state = Arc::new(Mutex::new(RequireState::default()));
