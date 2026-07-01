@@ -584,7 +584,7 @@ pub struct LuaRuntime {
 impl LuaRuntime {
     /// Build a Luau VM, evaluate the manifest-declared module, and extract its registrations.
     ///
-    /// Resolve the module path relative to the configure root.
+    /// Resolve the module path relative to the configure root and enable Luau native code generation.
     /// The [`ManifestModule`] allowlist controls access to `@mirage/` host libraries.
     ///
     /// # Errors
@@ -598,6 +598,8 @@ impl LuaRuntime {
         module_manifest: &ManifestModule,
     ) -> eyre::Result<Self> {
         let target_lua = Lua::new();
+
+        target_lua.enable_jit(true);
 
         let require_jail = configure_root.as_ref().canonicalize()?;
 

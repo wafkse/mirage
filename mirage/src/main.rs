@@ -38,7 +38,9 @@ fn main() {
 /// Initialise tracing with the `RUST_LOG` filter or the default `info` filter.
 fn init_tracing() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 }
 

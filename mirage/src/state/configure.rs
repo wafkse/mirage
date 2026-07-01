@@ -142,8 +142,7 @@ impl ConfigureState {
             target_value
         };
 
-        let target_context =
-            fold_context(candidate_tree, &manifest_candidates, &context_profile)?;
+        let target_context = fold_context(candidate_tree, &manifest_candidates, &context_profile)?;
 
         let (context_sender, ..) = watch::channel(target_context);
 
@@ -186,7 +185,10 @@ impl Background for ConfigureState {
         /// Input changes handled by [`ConfigureState`].
         #[derive(Debug)]
         enum ConfigureEvent {
+            /// An event from the configure tree watcher.
             Filesystem(notify::Event),
+
+            /// The selected profile changed.
             Profile,
         }
 

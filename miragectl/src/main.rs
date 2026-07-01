@@ -42,7 +42,10 @@ pub enum ControlCommand {
     },
 
     /// Merge a transient TOML fragment into the daemon's render context.
-    Mutate { value: String },
+    Mutate {
+        /// A TOML expression such as `system.battery-state = "low"`.
+        value: String,
+    },
 
     /// Print the daemon's current render context as a JSON response.
     Context,

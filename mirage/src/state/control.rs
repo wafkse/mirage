@@ -145,9 +145,8 @@ impl ControlState {
                 tracing::info!(%expression, "mutating context");
 
                 // NOTE: `toml_edit` accepts dotted-key fragments and preserves TOML value kinds.
-                let override_context =
-                    toml_edit::de::from_str::<toml::Value>(expression.as_str())
-                        .map_err(eyre::Report::from)?;
+                let override_context = toml_edit::de::from_str::<toml::Value>(expression.as_str())
+                    .map_err(eyre::Report::from)?;
 
                 context_pipe
                     .send_modify(|target_context| deep_merge(target_context, override_context));
@@ -169,8 +168,12 @@ impl Background for ControlState {
     type Output = ();
 
     async fn run(mut self) -> eyre::Result<Self::Output> {
+        /// Work serialized by the control dispatch loop.
         enum Operation {
+            /// A newly accepted client connection.
             Socket(UnixStream),
+
+            /// A decoded request paired with its response channel.
             Request(
                 (
                     ControlRequest,

@@ -28,7 +28,9 @@ use tracing::Instrument;
 use crate::{
     background::Background,
     filesystem,
-    manifest::{self, Manifest, ManifestCandidate, ManifestConfigure, ManifestModule, UndefinedKind},
+    manifest::{
+        self, Manifest, ManifestCandidate, ManifestConfigure, ManifestModule, UndefinedKind,
+    },
     state::{
         configure::{self, ConfigurePipe, ConfigureState},
         control::ControlState,
@@ -178,9 +180,11 @@ fn resolve(target_settings: MirageCli) -> eyre::Result<Resolved> {
     })
 }
 
-/// Daemon state for configure inputs and template hydration.
+/// The configure, hydration, and control subsystems of a daemon instance.
 ///
-/// Each rendered output is written beside its template with the template extension removed.
+/// Configure changes publish a TOML context to the hydration worker. That worker renders each
+/// template beside its source with the template extension removed. The control socket accepts
+/// requests to select profiles, mutate context values, inspect the context, and request rendering.
 // NOTE(invariant): None.
 #[derive(Debug)]
 pub struct Mirage {
@@ -282,10 +286,7 @@ impl Mirage {
             ..
         } = resolve(target_settings)?;
 
-        let lua_runtime = module_source
-            .as_ref()
-            .map(ModuleSource::load)
-            .transpose()?;
+        let lua_runtime = module_source.as_ref().map(ModuleSource::load).transpose()?;
 
         let target_context =
             configure::fold_context(configure_root.as_path(), &candidate_list, &profile)?;
@@ -317,7 +318,8 @@ impl Background for Mirage {
         let _ = thread_set
             .spawn(Background::run(configure).instrument(tracing::info_span!("configure")));
         let _ = thread_set.spawn(Background::run(hydrate));
-        let _ = thread_set.spawn(Background::run(control).instrument(tracing::info_span!("control")));
+        let _ =
+            thread_set.spawn(Background::run(control).instrument(tracing::info_span!("control")));
 
         let mut terminate_signal = signal(SignalKind::terminate())?;
 
