@@ -1,46 +1,54 @@
 # Mirage
 
-Mirage is a lightweight, asynchronous background daemon that orchestrates your dotfiles using a single source of truth.
+Mirage is an asynchronous background daemon that keeps your dotfiles in sync from a single source of truth.
 
-Managing a customized Linux desktop involves juggling overlapping design tokens: colors, fonts, borders and layout gaps, across tools that use entirely different configuration formats. Your terminal might use TOML, your window manager a custom syntax, your status bar JSON, and your app launcher CSS. Trying to keep these in sync usually means writing fragile `sed` scripts or adopting massive framework wrappers like Home Manager.
+A customized Linux desktop spreads the same handful of design tokens (colors, fonts, borders, gaps) across tools that all speak different configuration formats. Your terminal reads TOML, your window manager a custom syntax, your status bar JSON, your launcher CSS. Keeping them consistent usually comes down to fragile `sed` scripts or a large framework like Home Manager.
 
-Mirage solves this by completely separating your **data** from your **layout**. You define your variables in central TOML files, write your configurations as minijinja templates, and let Mirage hydrate everything on the fly. 
+Mirage keeps the data separate from the layout. You put your variables in central TOML files, write each application's config as a minijinja template, and let the daemon render them whenever the data changes.
 
-It acts as a reactive state engine for your filesystem.
+## Resource use
 
-### Extreme Resource Efficiency
+Mirage is meant to run continuously in the background. It is written in async Rust and spends nearly all of its time asleep, blocked on filesystem (`inotify`) and socket (`epoll`) syscalls. Running several instances across a system therefore costs very little memory.
 
-Mirage is designed to run continuously as a background process. Written in async Rust, it spends almost its entire lifecycle asleep, blocked on filesystem (`inotify`) and socket (`epoll`) syscalls. This is to make multiple Mirage instances running across the system not take a noticeable amount of memory. 
+## Core concepts
 
-## Core Concepts
+Mirage has two kinds of input: configure candidates (the data) and template candidates (the layouts).
 
-Mirage revolves around two primary concepts: **Configure Candidates** (the data) and **Template Candidates** (the layouts).
+### Configure candidates
 
-### Configure Candidates
-Configure candidates are standard TOML files that contain your system's variables. These are the single source of truth for your environment. 
+Configure candidates are plain TOML files holding your variables. They are the source of truth for the environment.
 
-Mirage maintains an active filesystem watch on all loaded configure candidates. **If a single TOML candidate is modified, Mirage instantly recalculates the entire state tree and forces a complete re-render of all tracked templates.** This guarantees that your environment is never out of sync.
+Mirage watches every loaded candidate. When one is modified it recomputes the whole state tree and re-renders all tracked templates, so the output never drifts from the data.
 
-### Template Candidates
-Template candidates are the actual configuration files for your applications, written using minijinja (Jinja2-compatible) templating syntax. Mirage recursively watches the target directory defined in your manifest for these files.
+### Template candidates
 
-Mirage identifies render targets by scanning for any file ending in the configured template extension, `.jinja` by default. You write your configuration files exactly as you normally would, injecting variables where needed (e.g., `{{ theme.base_color }}` or `{{ layout.gaps_in }}`).
+Template candidates are your application configs, written in minijinja (Jinja2-compatible) syntax. Mirage recursively watches the target directory from the manifest and treats any file ending in the configured template extension (`.jinja` by default) as a render target. You write the config as usual and inject variables where you need them, for example `{{ theme.base_color }}` or `{{ layout.gaps_in }}`.
 
-The extension is configurable with the `template-extension` key under `[configure]` (set it to `"tera"` to migrate a legacy tree without renaming). Undefined references are a hard render error by default; the `undefined` key (`"strict"`, `"lenient"`, or `"chainable"`) relaxes this.
+The extension comes from the `template-extension` key under `[configure]`; whatever you pick, the same minijinja engine renders it. Undefined references abort the render by default. The `undefined` key (`"strict"`, `"lenient"`, or `"chainable"`) loosens that.
 
-Filesystem watchers emit several notifications for a single logical edit (a rename, a data write, a metadata touch). Mirage coalesces such a burst into one render by holding the pass back for a short grace period, configurable with the `notificate-period` key under `[configure]` (milliseconds, defaulting to `50`). Setting it to `0` renders eagerly on every notification.
+A single edit often makes the filesystem emit several notifications: a rename, then a data write, then a metadata touch. Mirage holds the render back for a short grace period to coalesce the burst into one pass. That period is the `notificate-period` key under `[configure]`, in milliseconds, defaulting to `50`; set it to `0` to render on every notification.
 
-## The Manifest: Bringing It Together
+## The manifest
 
-To make Mirage work, you must define a `.mirage.toml` manifest file. This manifest tells the daemon where to find your data, where to output your templates, and how to resolve conflicts between your TOML files.
+Mirage is configured by a `.mirage.toml` manifest. It tells the daemon where the data lives, where to write output, and how to resolve conflicts between TOML files.
 
-A typical manifest looks like this:
-
-```
+```toml
 [configure]
 profile = "default"
+
+# Where hydrated templates live (or pass -T on the CLI).
 template = "/home/user/.config"
-listen_sock = "/home/user/.mirage.sock"
+
+# The Unix socket miragectl connects to (or pass -L on the CLI).
+listen-sock = "/home/user/.mirage.sock"
+
+# Luau module supplying template functions/filters/globals, resolved
+# relative to the configure root like `require` (dir -> index.luau).
+module = "engine.luau"
+
+# Undefined-reference behaviour: "strict" (default), "lenient", or
+# "chainable". Strict aborts the pass on any missing value.
+undefined = "strict"
 
 [[candidate]]
 path = "base.toml"
@@ -51,22 +59,24 @@ path = "**/[!.]*.toml"
 policy = "override"
 ```
 
-### Candidate Evaluation Order
-Mirage evaluates the `[[candidate]]` blocks sequentially, from top to bottom. The list is locked in at daemon startup, meaning your evaluation order is strictly deterministic. If multiple TOML files define the same variable, Mirage uses the order of these candidates to decide which value wins.
+### Candidate order
 
-### Merge Policies
-Mirage utilizes the `figment` configuration library under the hood. When it processes your candidates, it applies the `policy` you specify to handle conflicts. The supported merge policies are:
+Mirage reads the `[[candidate]]` blocks top to bottom, and the list is fixed at startup, so the order is deterministic. When several TOML files set the same variable, that order decides which value wins.
 
-* **`override`**: The standard behavior. Values in later candidates completely replace values from earlier candidates.
-* **`append`**: Arrays and collections are concatenated together instead of being overwritten.
-* **`fallback`**: The candidate only provides values for keys that have not already been defined by an earlier candidate.
-* **`supplement`**: Similar to fallback, but applies specifically to appending arrays without overriding existing entries.
+### Merge policies
+
+Merging runs on the `figment` library. Each candidate's `policy` controls how it combines with what came before:
+
+* `override`: later candidates replace earlier values. This is the usual choice.
+* `append`: arrays are concatenated instead of replaced.
+* `fallback`: the candidate only fills in keys no earlier candidate defined.
+* `supplement`: like `fallback`, but for appending to arrays without touching existing entries.
 
 ## Scripting with Luau
 
-Mirage ships no template function_table of its own. Every template function and filter is authored in Luau and supplied per deployment by a module the manifest points at via the `module` key under `[configure]` (resolved relative to the configure root, mirroring `require`).
+Apart from minijinja's own built-ins (the standard filters, plus the `json` feature's `tojson` for serializing a value tree to JSON), Mirage provides no template helpers of its own. Every domain-specific function and filter is written in Luau, in a module the manifest names with the `module` key under `[configure]`. The path resolves relative to the configure root the way `require` does.
 
-The module returns a table of what it exports:
+The module returns a table of its exports:
 
 ```lua
 return {
@@ -76,80 +86,76 @@ return {
 }
 ```
 
-`function_table` and `filter_table` become template function_table and filter_table under their keys, and `environment_table` become constant template environment_table. Module code receives template values as opaque, lazily-resolving handles: indexing walks the underlying value tree (`value.a.b[1]`) without materializing it, and `:kind()`, `:undefined()`, `:none()`, `:get(key)`, and `:materialize()` are available for inspection. A change to module code rebuilds the VM and forces a full re-render.
+Entries in `function_table` and `filter_table` register as template functions and filters under their keys, and `environment_table` supplies constant globals. Module code sees template values as opaque, lazily-resolving handles: indexing walks the underlying tree (`value.a.b[1]`) without materializing it, and `:kind()`, `:undefined()`, `:none()`, `:get(key)`, and `:materialize()` are there for inspection. Editing the module rebuilds the VM and forces a full re-render.
 
-The Luau VM and the rendering engine live on a dedicated hydration worker with its own runtime. On top of the vanilla Luau standard library, Mirage exposes its own modules under the `@mirage/<lib>` require convention, each gated by an explicit `[module].libraries` allowlist. Module function_table may be asynchronous — for example, with `@mirage/time` allowlisted, `require("@mirage/time").sleep(seconds)` can be `await`ed and the worker drives it to completion within the otherwise-synchronous render. A module evaluation error aborts the render pass under the same all-or-nothing contract as a template error.
+The Luau VM and the render engine share a dedicated hydration worker with its own runtime. Alongside the standard Luau library, Mirage exposes its own modules under the `@mirage/<lib>` require convention, each gated by the `[module].libraries` allowlist. A module function may be asynchronous: with `@mirage/time` allowlisted, `require("@mirage/time").sleep(seconds)` can be `await`ed, and the worker drives it to completion inside the otherwise synchronous render. An error while evaluating the module aborts the pass under the same all-or-nothing rule as a template error.
 
-## Profile & Variable Semantics
+## Profiles and variables
 
-Inside your TOML configure candidates, variables are organized into tables. Mirage treats these top-level tables as **Profiles**, which allows you to define conditional states (like a "powersave" mode or a "dark" theme) alongside your base configurations.
+Variables in the configure candidates live in top-level TOML tables. Mirage reads those tables as profiles, which lets you keep conditional states (a "powersave" mode, a "dark" theme) next to your base configuration. It resolves a variable through three layers:
 
-When Mirage builds its internal context, it resolves variables based on strict overriding semantics:
+1. `[default]`: the base. Used when nothing else defines the variable.
+2. `[<profile>]`: the active profile, say `[performance]`. Overrides the default for the current session.
+3. `[global]`: the top override. Beats every other block no matter which profile is active.
 
-1. **`[default]`**: The foundational layer. If a variable is not defined anywhere else, Mirage uses the value found in the `[default]` block.
-2. **`[<profile_name>]`**: The currently active profile layer (e.g., `[performance]`). Variables declared here override the fallback defaults for the current session.
-3. **`[global]`**: The absolute override layer. Variables placed in the `[global]` block supersede all other blocks, regardless of which profile is currently active.
+So you can write one large `[default]` across your files and add a small `[powersave]` that only overrides what it needs, like turning off compositor blur and animations.
 
-This layered approach allows you to set up a massive `[default]` configuration across your files, and then define a tiny `[powersave]` profile that only overrides the variables necessary to disable compositor blur and animations.
+## The hydration engine
 
-## The Hydration Engine
+A state change runs a transactional pipeline.
 
-When state changes, Mirage executes a strict, transactional pipeline to update your files.
+### All-or-nothing rendering
 
-### All-or-Nothing Rendering
-To ensure your desktop never ends up in a broken or half-configured state, Mirage treats every state change as a transaction. 
-When a re-render is triggered, Mirage evaluates *all* templates into a temporary directory on the same filesystem mount. If a single template fails to compile, whether due to a syntax error, a missing variable, or an invalid type, the entire hydration pass aborts. Your existing, working configurations are left completely untouched, and the error is logged.
+So the desktop never lands in a half-written state, each change is one transaction. Mirage renders every template into a temporary directory on the same filesystem mount. If any template fails, whether from a syntax error, a missing variable, or a bad type, the whole pass aborts, your current configs stay as they are, and the error is logged.
 
-### In-Place, Atomic Renames
+### In-place atomic renames
 
-Mirage does not use a separate "output" directory or a complex web of symlinks. It renders in-place.
+Mirage renders in place. There is no separate output directory and no symlink web. For `<filename>.<extension>.jinja` it writes the result next to the source as `<filename>.<extension>`, copies the original permissions, and swaps it in with an atomic `rename`. Because the swap is atomic, anything watching the file through `inotify` never sees a partial write or an empty file.
 
-When processing `<filename>.<extension>.jinja`, the compiled output is written directly adjacent to the source file as `<filename>.<extension>`. Mirage copies the original file permissions and applies the new file using an atomic `rename` syscall. 
+### One-shot rendering
 
-Because the replacement is atomic, external applications watching those files via `inotify` will never read a partial write or an empty file.
-
-### One-Shot Rendering
-
-Some workflows want a single hydration pass rather than a resident daemon: a login script, a `Makefile` target, or a `git` hook. Passing `--oneshot` folds the manifest, renders every template once under the same all-or-nothing contract, and exits without starting the daemon, binding the control socket, or establishing any filesystem watch.
+Some workflows want one pass instead of a resident daemon: a login script, a `Makefile` target, a `git` hook. `--oneshot` folds the manifest, renders every template once under the same all-or-nothing rule, and exits without starting the daemon, binding the socket, or watching the filesystem.
 
 ```bash
 # Render the manifest once and exit
 mirage --oneshot -C ~/.config/mirage
 ```
 
-### Deferred Side-Effects
+### Deferred side effects
 
-Certain applications require a Unix signal or shell command to reload their configuration. To support this, Mirage allows templates to register post-hydration shell commands via custom template function_table. 
+Some applications need a signal or a shell command before they pick up a new config. Templates can queue such commands through a helper function rather than running them on the spot. Mirage flushes the queue only after the atomic rename commits, so an application is never told to reload before its config is on disk.
 
-To prevent race conditions, these function_table do not execute immediately when the template is evaluated. Instead, they append commands to an internal queue. Mirage flushes and executes this side-effect queue only *after* the atomic rename phase successfully commits. The application is never instructed to reload before its configuration is safely written to disk.
+## Runtime control (`miragectl`)
 
-## The Runtime Control Plane (`miragectl`)
+Mirage listens on a Unix domain socket, set in the manifest and defaulting to `~/.mirage.sock`. The `miragectl` utility talks to that socket to change the daemon's state at runtime, which is handy from window manager keybinds, udev rules, or shell scripts.
 
-Mirage listens on a Unix Domain Socket (defined in the manifest, defaulting to `~/.mirage.sock`). The companion utility, `miragectl`, leverages this socket to mutate the daemon's internal state dynamically. This design enables deep integration with window manager keybinds, udev rules, or shell scripts.
+The commands are subcommands, and `-C`/`--connect <socket>` points at a specific daemon. `ping` and `hydrate` check liveness and force a re-render, `profile` and `mutate` reshape the context, and `context` dumps the daemon's resolved state.
 
-### Profile Toggling
-You can hot-swap massive blocks of variables instantly by telling the daemon to switch its active profile. This forces an immediate recalculation of the state tree and a full system re-render.
+### Switching profiles
+
+Swap a whole block of variables by changing the active profile. This recomputes the state tree and re-renders everything.
+
 ```bash
 # Switch the entire desktop to a performance state
-miragectl --profile "performance"
+miragectl profile "performance"
 ```
 
-### Ephemeral State Mutation
-You can inject specific variables directly into the daemon's memory space without modifying your TOML files. This is highly effective for updating hardware metrics or handling dynamic states that shouldn't be permanently saved to disk.
+### Transient mutation
+
+Inject a variable straight into the running daemon without editing any TOML. This suits hardware metrics and other dynamic state you would not want to persist.
+
 ```bash
 # Inject a dynamic variable into the state tree
-miragectl --mutate 'system.battery-state = "low"'
+miragectl mutate 'system.battery-state = "low"'
 ```
 
-## Operational Disclaimers
+## Notes
 
-Mirage is unopinionated power-user software. It delegates filesystem organization entirely to the user and expects you to manage your own repository hygiene.
+Mirage is unopinionated. It leaves filesystem layout to you and assumes you manage your own repository hygiene. A few suggestions:
 
-A teeny bit of personal recommendations:
-
-* You should add a negative `.gitignore` line to not include any non-template file into the untracked file pool if your dotfiles are being managed via Git: `!*.jinja`. This keeps hydrated artifacts out of the repository.
-* Do not edit non-template hydrated files directly, any re-hydration will override all your changes. The template dictates all.
-* Mirage logs through `tracing`. It defaults to informational output; set the standard `RUST_LOG` environment variable (e.g. `RUST_LOG=mirage=debug`) to raise the verbosity, with per-subsystem spans (`configure`, `hydrate`, `control`) framing each event.
+* If your dotfiles are in Git, add a negative ignore for templates so hydrated output stays out of the repo, for example `!*.jinja`.
+* Do not edit hydrated files by hand. The next render overwrites them; the template is the only source.
+* Mirage logs through `tracing` at info level by default. Set `RUST_LOG` (for example `RUST_LOG=mirage=debug`) to raise it, with per-subsystem spans (`configure`, `hydrate`, `control`) around each event.
 
 # License
 
