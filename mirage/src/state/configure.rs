@@ -1,7 +1,7 @@
 //! Candidate loading and publication of the active render context.
 //!
 //! [`ConfigureState`] watches the configure tree and selected profile. Relevant events rebuild
-//! the context through `ConfigureState::fold_context` and publish it through [`ConfigurePipe`].
+//! the context through `ConfigureState::fold` and publish it through [`ConfigurePipe`].
 
 use std::{
     ops::Deref,
@@ -102,8 +102,7 @@ impl ConfigureState {
             target_value
         };
 
-        let target_context =
-            Self::fold_context(candidate_tree, &manifest_candidates, &context_profile)?;
+        let target_context = Self::fold(candidate_tree, &manifest_candidates, &context_profile)?;
 
         let (context_sender, ..) = watch::channel(target_context);
 
@@ -146,7 +145,7 @@ impl ConfigureState {
     /// # Errors
     ///
     /// Returns an error when a candidate path cannot be expanded or globbed, or when the folded tree fails to deserialize.
-    pub(crate) fn fold_context(
+    pub(crate) fn fold(
         candidate_tree: &Path,
         manifest_candidates: &[ManifestCandidate],
         context_profile: &Profile,
@@ -155,7 +154,7 @@ impl ConfigureState {
 
         for target_value in manifest_candidates
             .iter()
-            .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
+            .map(|target_candidate| target_candidate.resolve(candidate_tree))
         {
             configure_list.extend(target_value?);
         }
@@ -256,7 +255,7 @@ impl Background for ConfigureState {
             };
 
             if target_state {
-                let target_context = Self::fold_context(
+                let target_context = Self::fold(
                     candidate_tree.as_path(),
                     &manifest_candidates,
                     &Profile::clone(profile_recv.borrow().deref()),

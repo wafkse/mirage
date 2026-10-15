@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use eyre::eyre;
+use eyre::{WrapErr, eyre};
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use notify::{RecursiveMode, Watcher};
 use tempfile::{TempDir, tempdir_in};
@@ -76,9 +76,6 @@ pub struct HydrationState {
 
     /// The grace period over which a burst of filesystem notifications is coalesced into a single render.
     notificate_period: Duration,
-
-    /// A boolean that indicates whether the startup hydrate has been performed.
-    start_hydrate: bool,
 }
 
 /// An event to the hydration subsystem.
@@ -134,8 +131,6 @@ impl HydrationState {
 
         let template_root = template_root.as_ref().to_path_buf();
 
-        let start_hydrate = false;
-
         Ok(Self {
             lua_runtime,
             module_source,
@@ -146,14 +141,14 @@ impl HydrationState {
             template_extension,
             undefined,
             notificate_period,
-            start_hydrate,
         })
     }
 
     /// Drive the synchronous hydration loop on the worker thread.
     ///
-    /// A current-thread runtime waits for events and drives asynchronous Luau calls. Rendering
-    /// runs between event waits, with each `block_on` call finishing before the next begins.
+    /// Render the initial context before waiting for events. A current-thread runtime drives
+    /// asynchronous Luau calls and subsequent event waits. Each `block_on` call finishes before
+    /// the next begins.
     fn drive(self) -> eyre::Result<()> {
         let Self {
             mut lua_runtime,
@@ -165,7 +160,6 @@ impl HydrationState {
             template_extension,
             undefined,
             notificate_period,
-            mut start_hydrate,
         } = self;
 
         let _span = tracing::info_span!("hydrate").entered();
@@ -184,22 +178,24 @@ impl HydrationState {
 
         let template_tree = TemplateTree::new(template_root, template_extension);
 
+        let renderer = Renderer::new(
+            &target_runtime,
+            lua_runtime.as_ref(),
+            &template_tree,
+            undefined,
+        );
+
+        Self::hydrate(&renderer, &context_pipe.borrow())?;
+
         loop {
-            let target_event = target_runtime.block_on(Self::next_event(
+            let target_event = target_runtime.block_on(Self::event(
                 &mut watcher_template,
                 &mut watcher_module,
                 &mut context_pipe,
             ));
 
-            let (target_change, mut reload_module) = if start_hydrate {
-                target_event.classify(template_tree.extension())
-            } else {
-                start_hydrate = true;
-
-                tracing::debug!("performing startup hydrate");
-
-                (true, false)
-            };
+            let (target_change, mut reload_module) =
+                target_event.classify(template_tree.extension());
 
             if !target_change {
                 tracing::trace!(?target_event, "ignoring inert event");
@@ -207,14 +203,16 @@ impl HydrationState {
                 continue;
             }
 
-            // NOTE: Each received event restarts the quiet interval before rendering.
+            // NOTE: Relevant input changes restart the quiet interval before rendering.
             if !notificate_period.is_zero() {
                 target_runtime.block_on(async {
                     let mut coalesced = 0_usize;
 
-                    while let Ok(extra_event) = tokio::time::timeout(
-                        notificate_period,
-                        Self::next_event(
+                    let mut deadline = tokio::time::Instant::now() + notificate_period;
+
+                    while let Ok(extra_event) = tokio::time::timeout_at(
+                        deadline,
+                        Self::event(
                             &mut watcher_template,
                             &mut watcher_module,
                             &mut context_pipe,
@@ -222,11 +220,20 @@ impl HydrationState {
                     )
                     .await
                     {
-                        let (.., extra_reload) = extra_event.classify(template_tree.extension());
+                        let (extra_change, extra_reload) =
+                            extra_event.classify(template_tree.extension());
 
-                        reload_module |= extra_reload;
+                        if extra_change {
+                            reload_module |= extra_reload;
 
-                        coalesced += 1;
+                            coalesced += 1;
+
+                            deadline = tokio::time::Instant::now() + notificate_period;
+                        }
+
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
                     }
 
                     if coalesced > 0 {
@@ -241,11 +248,9 @@ impl HydrationState {
 
                 match target_source.load() {
                     Ok(target_module) => lua_runtime = Some(target_module),
-                    Err(target_error) => Self::report_error(&target_error),
+                    Err(target_error) => Self::report(&target_error),
                 }
             }
-
-            let temp_filedir = tempdir_in(template_tree.root())?;
 
             let renderer = Renderer::new(
                 &target_runtime,
@@ -254,11 +259,24 @@ impl HydrationState {
                 undefined,
             );
 
-            let target_value = renderer.render(&context_pipe.borrow(), temp_filedir);
+            Self::hydrate(&renderer, &context_pipe.borrow())?;
+        }
+    }
 
-            match target_value {
-                Ok(staged_render) => staged_render.commit()?,
-                Err(target_error) => Self::report_error(&target_error),
+    /// Render the current context and retain watcher execution after rendering failures.
+    ///
+    /// Staging-directory creation and output-replacement errors terminate the worker.
+    fn hydrate(renderer: &Renderer<'_>, target_context: &toml::Value) -> eyre::Result<()> {
+        let Renderer { template_tree, .. } = renderer;
+
+        let temp_filedir = tempdir_in(template_tree.root())?;
+
+        match renderer.render(target_context, temp_filedir) {
+            Ok(staged_render) => staged_render.commit(),
+            Err(target_error) => {
+                Self::report(&target_error);
+
+                Ok(())
             }
         }
     }
@@ -302,7 +320,7 @@ impl Background for HydrationState {
 
 impl HydrationState {
     /// Await the next hydration event across the template watcher, the optional module watcher, and the context pipe.
-    async fn next_event(
+    async fn event(
         watcher_template: &mut FsWatcher,
         watcher_module: &mut Option<FsWatcher>,
         context_pipe: &mut watch::Receiver<toml::Value>,
@@ -330,7 +348,7 @@ impl HydrationState {
     /// # Errors
     ///
     /// Returns an error when the runtime cannot be built, a template fails to render, or a staged rename cannot be committed.
-    pub(crate) fn render_once(
+    pub(crate) fn oneshot(
         lua_runtime: Option<&LuaRuntime>,
         template_root: &Path,
         template_extension: &str,
@@ -357,7 +375,7 @@ impl HydrationState {
     /// Log a render or module reload error chain through tracing.
     ///
     /// The worker continues waiting for input changes after these failures.
-    fn report_error(target_report: &eyre::Report) {
+    fn report(target_report: &eyre::Report) {
         let target_chain = target_report
             .chain()
             .map(ToString::to_string)
@@ -380,10 +398,7 @@ impl HydrationEvent {
                     | notify::EventKind::Remove(notify::event::RemoveKind::File),
                 paths: path_list,
                 ..
-            }) => (
-                Self::paths_bear_extension(path_list, template_extension),
-                false,
-            ),
+            }) => (Self::matches(path_list, template_extension), false),
             HydrationEvent::Module(notify::Event {
                 kind:
                     notify::EventKind::Modify(
@@ -394,7 +409,7 @@ impl HydrationEvent {
                 paths: path_list,
                 ..
             }) => {
-                let target_change = Self::paths_bear_extension(path_list, "luau");
+                let target_change = Self::matches(path_list, "luau");
 
                 (target_change, target_change)
             }
@@ -406,7 +421,7 @@ impl HydrationEvent {
     /// Determine whether every path in an event has the supplied extension.
     ///
     /// Extension matching is case insensitive. An empty path list returns `true`.
-    fn paths_bear_extension(path_list: &[PathBuf], target_extension: &str) -> bool {
+    fn matches(path_list: &[PathBuf], target_extension: &str) -> bool {
         path_list.iter().all(|target_path| {
             target_path
                 .extension()
@@ -618,7 +633,7 @@ impl<'render> Renderer<'render> {
 
         let target_environment = self.environment();
 
-        let target_context = MirageValue::from(target_context).into_value();
+        let target_context = MirageValue::from(target_context).value();
 
         let mut rename_list = Vec::new();
 
@@ -683,7 +698,8 @@ impl StagedRender {
         } = self;
 
         for (from, to) in rename_list {
-            fs::rename(from, to)?;
+            fs::rename(&from, &to)
+                .wrap_err_with(|| format!("could not replace output `{}`", to.display()))?;
         }
 
         Ok(())
@@ -692,7 +708,7 @@ impl StagedRender {
 
 #[cfg(test)]
 mod tests {
-    use super::{Renderer, TemplateTree};
+    use super::{Renderer, StagedRender, TemplateTree};
 
     use std::sync::Arc;
 
@@ -804,5 +820,40 @@ mod tests {
         staged.commit().unwrap();
 
         assert_eq!(std::fs::read_to_string(output_path).unwrap(), "mirage");
+    }
+
+    #[test]
+    fn commit() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let temp_filedir = tempfile::tempdir_in(directory.path()).unwrap();
+
+        let first = directory.path().join("first");
+        let blocked = directory.path().join("blocked");
+        let later = directory.path().join("later");
+
+        std::fs::write(&first, "previous").unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(&later, "previous").unwrap();
+
+        let mut rename_list = Vec::new();
+
+        for (name, destination) in [("first", &first), ("blocked", &blocked), ("later", &later)] {
+            let source = temp_filedir.path().join(name);
+
+            std::fs::write(&source, "updated").unwrap();
+
+            rename_list.push((source, destination.clone()));
+        }
+
+        let staged = StagedRender {
+            temp_filedir,
+            rename_list,
+        };
+
+        assert!(staged.commit().is_err());
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "updated");
+        assert!(blocked.is_dir());
+        assert_eq!(std::fs::read_to_string(later).unwrap(), "previous");
     }
 }

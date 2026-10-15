@@ -130,7 +130,7 @@ impl ControlState {
                     .map_err(eyre::Report::from)?;
 
                 context_pipe.send_modify(|target_context| {
-                    Self::deep_merge(target_context, override_context);
+                    Self::merge(target_context, override_context);
                 });
 
                 Ok(ControlResponse::Acknowledge)
@@ -148,12 +148,12 @@ impl ControlState {
     /// Deep-merge an overlay value tree onto a base render context.
     ///
     /// Tables merge recursively. Arrays, scalars, and values of different kinds are replaced by the overlay.
-    fn deep_merge(target_context: &mut toml::Value, override_context: toml::Value) {
+    fn merge(target_context: &mut toml::Value, override_context: toml::Value) {
         match (target_context, override_context) {
             (toml::Value::Table(target_table), toml::Value::Table(override_table)) => {
                 for (target_key, override_value) in override_table {
                     match target_table.get_mut(&target_key) {
-                        Some(target_value) => Self::deep_merge(target_value, override_value),
+                        Some(target_value) => Self::merge(target_value, override_value),
                         None => {
                             let _ = target_table.insert(target_key, override_value);
                         }
@@ -284,7 +284,7 @@ mod tests {
             toml::from_str::<toml::Value>("[system]\nbattery = \"low\"\ntags = [\"b\", \"c\"]\n")
                 .unwrap();
 
-        ControlState::deep_merge(&mut target_context, override_context);
+        ControlState::merge(&mut target_context, override_context);
 
         let target_system = target_context.get("system").unwrap();
 
@@ -304,7 +304,7 @@ mod tests {
         let override_context =
             toml_edit::de::from_str::<toml::Value>("system.battery-state = \"low\"").unwrap();
 
-        ControlState::deep_merge(&mut target_context, override_context);
+        ControlState::merge(&mut target_context, override_context);
 
         let target_system = target_context.get("system").unwrap();
 

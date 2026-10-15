@@ -1,7 +1,7 @@
 //! Manifest settings, candidate discovery, and merge policies.
 //!
 //! [`Manifest`] describes the template root, configure candidates, and optional Luau module.
-//! [`ManifestCandidate::resolve_at`] expands candidate paths and globs. [`Candidate::combine`]
+//! [`ManifestCandidate::resolve`] expands candidate paths and globs. [`Candidate::combine`]
 //! applies each discovered file to the profile data using its declared [`MergePolicy`].
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +29,7 @@ pub const DEFAULT_TEMPLATE_EXTENSION: &str = "jinja";
 
 /// The default quiet interval in milliseconds before rendering after an input change.
 ///
-/// Each event received during the interval restarts the wait. See [`ManifestConfigure::notificate_period`].
+/// Each relevant input event restarts the wait. See [`ManifestConfigure::notificate_period`].
 pub const DEFAULT_NOTIFICATE_PERIOD: u64 = 50;
 
 /// The manifest of a Mirage-managed directory.
@@ -117,14 +117,14 @@ pub struct ManifestModule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MergePolicy {
-    /// Replace conflicting values with candidate values through [`Figment::merge`].
+    /// Replace conflicting scalar values and arrays through [`Figment::merge`].
     #[default]
     Override,
 
-    /// Keep existing values and fill missing keys through [`Figment::join`].
+    /// Replace conflicting scalars and concatenate arrays through [`Figment::admerge`].
     Append,
 
-    /// Replace conflicting values and concatenate arrays through [`Figment::admerge`].
+    /// Keep existing values and fill missing keys through [`Figment::join`].
     Fallback,
 
     /// Keep existing values and concatenate arrays through [`Figment::adjoin`].
@@ -136,7 +136,7 @@ pub enum MergePolicy {
 pub struct ManifestCandidate {
     /// The candidate path.
     ///
-    /// Shell expansion and glob matching occur in [`Self::resolve_at`].
+    /// Shell expansion and glob matching occur in [`Self::resolve`].
     pub path: String,
 
     /// The merge policy for this candidate.
@@ -152,7 +152,7 @@ impl ManifestCandidate {
     ///
     /// Returns an error when the candidate path cannot be expanded or its glob pattern is invalid.
     #[inline]
-    pub fn resolve_at(
+    pub fn resolve(
         &self,
         relative_root: impl AsRef<Path>,
     ) -> eyre::Result<impl FusedIterator<Item = Candidate>> {
@@ -163,7 +163,7 @@ impl ManifestCandidate {
         let mut target_list = Vec::new();
 
         // NOTE: Absolute paths produced by expansion supply their own root for glob matching.
-        let expanded_path = ExpandedPath::new(path)?.into_path();
+        let expanded_path = ExpandedPath::new(path)?.path();
 
         for target_value in glob(
             relative_root
@@ -207,9 +207,66 @@ impl Candidate {
 
         match policy {
             MergePolicy::Override => Figment::merge(target_value, target_data),
-            MergePolicy::Append => Figment::join(target_value, target_data),
-            MergePolicy::Fallback => Figment::admerge(target_value, target_data),
+            MergePolicy::Append => Figment::admerge(target_value, target_data),
+            MergePolicy::Fallback => Figment::join(target_value, target_data),
             MergePolicy::Supplement => Figment::adjoin(target_value, target_data),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Candidate, DefaultFormat, MergePolicy};
+
+    use figment::{Figment, providers::Data};
+
+    #[test]
+    fn policies() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let base = directory.path().join("base.toml");
+        let overlay = directory.path().join("overlay.toml");
+
+        std::fs::write(&base, "[default]\nscalar = 'base'\narray = ['base']\n[default.nested]\nretained = 1\nconflict = 'base'\n").unwrap();
+        std::fs::write(&overlay, "[default]\nscalar = 'candidate'\narray = ['candidate']\nadded = 'value'\n[default.nested]\nintroduced = 2\nconflict = 'candidate'\n").unwrap();
+
+        for (policy, scalar, array) in [
+            (MergePolicy::Override, "candidate", vec!["candidate"]),
+            (MergePolicy::Append, "candidate", vec!["base", "candidate"]),
+            (MergePolicy::Fallback, "base", vec!["base"]),
+            (MergePolicy::Supplement, "base", vec!["base", "candidate"]),
+        ] {
+            let path = overlay.clone();
+
+            let candidate = Candidate { path, policy };
+
+            let base = Figment::new().merge(Data::<DefaultFormat>::file(&base).nested());
+
+            let result = candidate
+                .combine::<DefaultFormat>(base)
+                .extract::<toml::Value>()
+                .unwrap();
+
+            let expected = toml::Value::try_from(array).unwrap();
+
+            assert_eq!(result["scalar"].as_str(), Some(scalar), "{policy:?}");
+            assert_eq!(result["array"], expected, "{policy:?}");
+            assert_eq!(result["added"].as_str(), Some("value"), "{policy:?}");
+            assert_eq!(
+                result["nested"]["retained"].as_integer(),
+                Some(1),
+                "{policy:?}"
+            );
+            assert_eq!(
+                result["nested"]["introduced"].as_integer(),
+                Some(2),
+                "{policy:?}"
+            );
+            assert_eq!(
+                result["nested"]["conflict"].as_str(),
+                Some(scalar),
+                "{policy:?}"
+            );
         }
     }
 }

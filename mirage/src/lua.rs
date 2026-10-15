@@ -46,7 +46,7 @@ impl MirageValue {
     /// Consume the wrapper and return its template value.
     #[inline]
     #[must_use]
-    pub fn into_value(self) -> minijinja::Value {
+    pub fn value(self) -> minijinja::Value {
         let Self(target_value) = self;
 
         target_value
@@ -83,7 +83,7 @@ impl MirageValue {
             // NOTE: `get` reaches data keys that share a reserved method name.
             _ => target_lua.create_function(
                 move |target_lua, (_, key): (mlua::Value, mlua::Value)| {
-                    Self(target_value.clone()).data_index(target_lua, &key)
+                    Self(target_value.clone()).index(target_lua, &key)
                 },
             ),
         }?;
@@ -96,7 +96,7 @@ impl MirageValue {
     /// String keys resolve attributes and integer keys resolve items using `MiniJinja`'s indices.
     /// Unsupported keys and undefined results yield `nil`. A `none` value retains its [`MirageValue`]
     /// wrapper and can be tested with `:none()`.
-    fn data_index(&self, target_lua: &Lua, key: &mlua::Value) -> mlua::Result<mlua::Value> {
+    fn index(&self, target_lua: &Lua, key: &mlua::Value) -> mlua::Result<mlua::Value> {
         let Self(target_value) = self;
 
         let resolved = match key {
@@ -121,10 +121,7 @@ impl MirageValue {
     ///
     /// Sequences yield one-based positional keys. Maps yield keys converted to native Lua scalars.
     /// The returned iterator walks this eagerly captured snapshot.
-    fn pairs_snapshot(
-        &self,
-        target_lua: &Lua,
-    ) -> mlua::Result<Vec<(mlua::Value, minijinja::Value)>> {
+    fn snapshot(&self, target_lua: &Lua) -> mlua::Result<Vec<(mlua::Value, minijinja::Value)>> {
         use minijinja::value::ValueKind;
 
         let Self(target_value) = self;
@@ -155,7 +152,7 @@ impl MirageValue {
                         .get_item(&target_key)
                         .map_err(|target_error| mlua::Error::runtime(target_error.to_string()))?;
 
-                    snapshot.push((Self::key_to_lua(target_lua, &target_key)?, target_item));
+                    snapshot.push((Self::key(target_lua, &target_key)?, target_item));
                 }
             }
             _ => {}
@@ -167,7 +164,7 @@ impl MirageValue {
     /// Lower a minijinja map key to a native Lua scalar for iteration.
     ///
     /// Integer keys become Lua integers. Other keys become strings.
-    fn key_to_lua(target_lua: &Lua, target_key: &minijinja::Value) -> mlua::Result<mlua::Value> {
+    fn key(target_lua: &Lua, target_key: &minijinja::Value) -> mlua::Result<mlua::Value> {
         if let Some(target_integer) = target_key.as_i64() {
             Ok(mlua::Value::Integer(target_integer))
         } else if let Some(target_string) = target_key.as_str() {
@@ -266,9 +263,9 @@ impl UserData for MirageValue {
                     {
                         target_self.method(target_lua, method_name.as_ref())
                     }
-                    _ => target_self.data_index(target_lua, &key),
+                    _ => target_self.index(target_lua, &key),
                 },
-                _ => target_self.data_index(target_lua, &key),
+                _ => target_self.index(target_lua, &key),
             },
         );
 
@@ -302,7 +299,7 @@ impl UserData for MirageValue {
 
         // NOTE: Luau generalized iteration calls `__iter`.
         target_methods.add_meta_method(MetaMethod::Iter, |target_lua, target_self, ()| {
-            let snapshot = target_self.pairs_snapshot(target_lua)?;
+            let snapshot = target_self.snapshot(target_lua)?;
 
             let cursor = std::cell::Cell::new(0_usize);
 
@@ -340,13 +337,13 @@ impl From<&toml::Value> for MirageValue {
             toml::Value::Array(target_list) => minijinja::Value::from(
                 target_list
                     .iter()
-                    .map(|target_value| Self::from(target_value).into_value())
+                    .map(|target_value| Self::from(target_value).value())
                     .collect::<Vec<_>>(),
             ),
             toml::Value::Table(target_table) => target_table
                 .iter()
                 .map(|(target_key, target_value)| {
-                    (target_key.clone(), Self::from(target_value).into_value())
+                    (target_key.clone(), Self::from(target_value).value())
                 })
                 .collect(),
         };
@@ -361,9 +358,7 @@ impl TryFrom<mlua::Value> for MirageValue {
     /// Convert Luau return data, checking table depth, cycles, and key kinds.
     #[inline]
     fn try_from(target_value: mlua::Value) -> Result<Self, Self::Error> {
-        ValueConversion::default()
-            .convert_value(target_value, 0)
-            .map(Self)
+        ValueConversion::default().value(target_value, 0).map(Self)
     }
 }
 
@@ -381,18 +376,18 @@ impl ValueConversion {
 
     /// Build a render-time engine error carrying the provided message.
     #[inline]
-    fn render_error(message: impl Into<String>) -> Error {
+    fn error(message: impl Into<String>) -> Error {
         Error::new(ErrorKind::InvalidOperation, message.into())
     }
 
     /// Convert a Luau failure into a `MiniJinja` rendering error.
     #[inline]
-    fn into_render_error(target_error: &mlua::Error) -> Error {
-        Self::render_error(target_error.to_string())
+    fn failure(target_error: &mlua::Error) -> Error {
+        Self::error(target_error.to_string())
     }
 
     /// The recursive worker behind [`MirageValue::try_from`], threading the depth budget and cycle-detection set.
-    fn convert_value(
+    fn value(
         &mut self,
         target_value: mlua::Value,
         depth: usize,
@@ -408,19 +403,19 @@ impl ValueConversion {
                     target_value.as_bytes().to_vec(),
                 )),
             },
-            mlua::Value::Table(target_table) => self.convert_table(&target_table, depth),
+            mlua::Value::Table(target_table) => self.table(&target_table, depth),
             mlua::Value::UserData(target_userdata) => {
                 if let Ok(target_value) = target_userdata.borrow::<MirageValue>() {
                     let MirageValue(target_value) = &*target_value;
 
                     Ok(target_value.clone())
                 } else {
-                    Err(Self::render_error(
+                    Err(Self::error(
                         "foreign userdata cannot be converted to a value",
                     ))
                 }
             }
-            mlua::Value::Function(..) => Err(Self::render_error(
+            mlua::Value::Function(..) => Err(Self::error(
                 "a Luau function cannot be returned as template data",
             )),
             mlua::Value::Vector(..)
@@ -428,29 +423,27 @@ impl ValueConversion {
             | mlua::Value::LightUserData(..)
             | mlua::Value::Error(..)
             | mlua::Value::Buffer(..)
-            | mlua::Value::Other(..) => Err(Self::render_error(
-                "value cannot be converted to template data",
-            )),
+            | mlua::Value::Other(..) => {
+                Err(Self::error("value cannot be converted to template data"))
+            }
         }
     }
 
     /// Convert a Luau table while retaining its identity only for the active recursion path.
-    fn convert_table(
+    fn table(
         &mut self,
         target_table: &mlua::Table,
         depth: usize,
     ) -> Result<minijinja::Value, Error> {
         if depth >= Self::MAX_TABLE_DEPTH {
-            Err(Self::render_error(
-                "maximum table conversion depth exceeded",
-            ))
+            Err(Self::error("maximum table conversion depth exceeded"))
         } else {
             let Self { visited } = self;
 
             let identity = target_table.to_pointer();
 
             if visited.insert(identity) {
-                let target_result = self.table_value(target_table, depth);
+                let target_result = self.entries(target_table, depth);
 
                 let Self { visited } = self;
 
@@ -458,15 +451,13 @@ impl ValueConversion {
 
                 target_result
             } else {
-                Err(Self::render_error(
-                    "a cyclic table cannot be converted to a value",
-                ))
+                Err(Self::error("a cyclic table cannot be converted to a value"))
             }
         }
     }
 
     /// Convert the admitted table's entries into a sequence or a map.
-    fn table_value(
+    fn entries(
         &mut self,
         target_table: &mlua::Table,
         depth: usize,
@@ -474,15 +465,15 @@ impl ValueConversion {
         let entries = target_table
             .pairs::<mlua::Value, mlua::Value>()
             .collect::<mlua::Result<Vec<_>>>()
-            .map_err(|target_error| Self::into_render_error(&target_error))?;
+            .map_err(|target_error| Self::failure(&target_error))?;
 
-        match (entries.as_slice(), Self::as_sequence(&entries)) {
+        match (entries.as_slice(), Self::sequence(&entries)) {
             ([], _) => Ok(minijinja::Value::from(Vec::<minijinja::Value>::new())),
             (_, Some(target_sequence)) => {
                 let mut target_list = Vec::with_capacity(target_sequence.len());
 
                 for target_item in target_sequence {
-                    target_list.push(self.convert_value(target_item.clone(), depth + 1)?);
+                    target_list.push(self.value(target_item.clone(), depth + 1)?);
                 }
 
                 Ok(minijinja::Value::from(target_list))
@@ -491,8 +482,8 @@ impl ValueConversion {
                 let mut target_pairs = Vec::with_capacity(entries.len());
 
                 for (target_key, target_item) in entries {
-                    let target_key = Self::convert_key(target_key)?;
-                    let target_item = self.convert_value(target_item.clone(), depth + 1)?;
+                    let target_key = Self::key(target_key)?;
+                    let target_item = self.value(target_item.clone(), depth + 1)?;
 
                     target_pairs.push((target_key, target_item));
                 }
@@ -503,7 +494,7 @@ impl ValueConversion {
     }
 
     /// Decide whether a table's entries form an array (keys exactly `1..=n`), returning the values in order if so.
-    fn as_sequence<'a>(entries: &'a [(mlua::Value, mlua::Value)]) -> Option<Vec<&'a mlua::Value>> {
+    fn sequence<'a>(entries: &'a [(mlua::Value, mlua::Value)]) -> Option<Vec<&'a mlua::Value>> {
         let count = entries.len();
 
         let mut ordered: Vec<Option<&'a mlua::Value>> = vec![None; count];
@@ -534,16 +525,14 @@ impl ValueConversion {
     /// Convert a Luau table key into a [`minijinja::Value`] map key.
     ///
     /// Accepts integer and UTF-8 string keys. Other key kinds produce an error.
-    fn convert_key(target_key: &mlua::Value) -> Result<minijinja::Value, Error> {
+    fn key(target_key: &mlua::Value) -> Result<minijinja::Value, Error> {
         match target_key {
             mlua::Value::Integer(target_key) => Ok(minijinja::Value::from(*target_key)),
             mlua::Value::String(target_key) => match target_key.to_str() {
                 Ok(target_key) => Ok(minijinja::Value::from(String::from(&*target_key))),
-                Err(..) => Err(Self::render_error(
-                    "a non-UTF-8 string is not a valid map key",
-                )),
+                Err(..) => Err(Self::error("a non-UTF-8 string is not a valid map key")),
             },
-            _ => Err(Self::render_error("unsupported map key type")),
+            _ => Err(Self::error("unsupported map key type")),
         }
     }
 }
@@ -603,9 +592,9 @@ impl LuaCallable {
         // NOTE: Rendering starts after the event wait's `block_on` has finished.
         let target_return = target_runtime
             .block_on(target_function.call_async::<mlua::Value>(Variadic::from(lua_args)))
-            .map_err(|target_error| ValueConversion::into_render_error(&target_error))?;
+            .map_err(|target_error| ValueConversion::failure(&target_error))?;
 
-        MirageValue::try_from(target_return).map(MirageValue::into_value)
+        MirageValue::try_from(target_return).map(MirageValue::value)
     }
 }
 
@@ -931,7 +920,7 @@ impl LuaRuntime {
         let module_value = target_require.call::<mlua::Value>(module_spec)?;
 
         let (target_function_table, target_filter_table, target_environment_table) =
-            Self::extract_exports(&module_value)?;
+            Self::exports(&module_value)?;
 
         Ok(Self {
             _target_lua: target_lua,
@@ -967,14 +956,14 @@ impl LuaRuntime {
 
             let target_runtime = Arc::clone(target_runtime);
 
-            let callable = LuaCallable::new(target_function, target_runtime);
+            let target_callable = LuaCallable::new(target_function, target_runtime);
 
             target_environment.add_function(
                 target_name.clone(),
                 move |target_args: Rest<minijinja::Value>| {
                     let Rest(target_args) = target_args;
 
-                    callable.invoke(None, target_args)
+                    target_callable.invoke(None, target_args)
                 },
             );
         }
@@ -1003,9 +992,11 @@ impl LuaRuntime {
 
     /// Extract the `function_table`, `filter_table`, and `environment_table` tables from an evaluated module value.
     ///
-    /// A non-table module value yields empty exports. Missing export tables yield empty registrations
-    /// for that category. Unknown top-level keys are ignored.
-    fn extract_exports(module_value: &mlua::Value) -> eyre::Result<ModuleExports> {
+    /// A non-table module value yields empty exports, and a missing export tables yield empty registrations
+    /// for that category.
+    ///
+    /// Unknown top-level keys are ignored.
+    fn exports(module_value: &mlua::Value) -> eyre::Result<ModuleExports> {
         let mut target_function_table = Vec::new();
         let mut target_filter_table = Vec::new();
         let mut target_environment_table = Vec::new();
@@ -1030,7 +1021,7 @@ impl LuaRuntime {
                     let (target_name, target_value) = target_pair?;
 
                     let target_value = MirageValue::try_from(target_value)
-                        .map(MirageValue::into_value)
+                        .map(MirageValue::value)
                         .map_err(|target_error| eyre!("{target_error}"))?;
 
                     target_environment_table.push((target_name, target_value));
@@ -1052,7 +1043,7 @@ mod tests {
 
     impl LuaRuntime {
         /// Build the current-thread runtime used by registered module callables in tests.
-        fn block_runtime() -> Arc<Runtime> {
+        fn runtime() -> Arc<Runtime> {
             Arc::new(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1065,17 +1056,17 @@ mod tests {
     #[test]
     fn toml_primitives_keep_their_types() {
         assert_eq!(
-            MirageValue::from(&toml::Value::Integer(7)).into_value(),
+            MirageValue::from(&toml::Value::Integer(7)).value(),
             minijinja::Value::from(7_i64)
         );
 
         assert_eq!(
-            MirageValue::from(&toml::Value::Float(1.5)).into_value(),
+            MirageValue::from(&toml::Value::Float(1.5)).value(),
             minijinja::Value::from(1.5_f64)
         );
 
         assert_eq!(
-            MirageValue::from(&toml::Value::Boolean(true)).into_value(),
+            MirageValue::from(&toml::Value::Boolean(true)).value(),
             minijinja::Value::from(true)
         );
 
@@ -1084,7 +1075,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            MirageValue::from(&toml::Value::Datetime(target_datetime)).into_value(),
+            MirageValue::from(&toml::Value::Datetime(target_datetime)).value(),
             minijinja::Value::from("1979-05-27T07:32:00Z")
         );
     }
@@ -1095,7 +1086,7 @@ mod tests {
 
         let target_value: mlua::Value = target_lua.load("return {10, 20, 30}").eval().unwrap();
 
-        let target_value = MirageValue::try_from(target_value).unwrap().into_value();
+        let target_value = MirageValue::try_from(target_value).unwrap().value();
 
         assert_eq!(target_value.len(), Some(3));
         assert_eq!(
@@ -1113,7 +1104,7 @@ mod tests {
             .eval()
             .unwrap();
 
-        let target_value = MirageValue::try_from(target_value).unwrap().into_value();
+        let target_value = MirageValue::try_from(target_value).unwrap().value();
 
         assert_eq!(
             target_value.get_attr("name").unwrap(),
@@ -1132,10 +1123,7 @@ mod tests {
         let target_value: mlua::Value = target_lua.load("return {}").eval().unwrap();
 
         assert_eq!(
-            MirageValue::try_from(target_value)
-                .unwrap()
-                .into_value()
-                .len(),
+            MirageValue::try_from(target_value).unwrap().value().len(),
             Some(0)
         );
     }
@@ -1174,10 +1162,7 @@ mod tests {
 
         let returned: mlua::Value = identity.call(MirageValue(original.clone())).unwrap();
 
-        assert_eq!(
-            MirageValue::try_from(returned).unwrap().into_value(),
-            original
-        );
+        assert_eq!(MirageValue::try_from(returned).unwrap().value(), original);
     }
 
     #[test]
@@ -1196,7 +1181,7 @@ mod tests {
         let returned: mlua::Value = lookup.call(MirageValue(nested)).unwrap();
 
         assert_eq!(
-            MirageValue::try_from(returned).unwrap().into_value(),
+            MirageValue::try_from(returned).unwrap().value(),
             minijinja::Value::from(8_i64)
         );
     }
@@ -1220,7 +1205,7 @@ mod tests {
 
         let mut target_environment = Environment::new();
 
-        target_runtime.register(&mut target_environment, &LuaRuntime::block_runtime());
+        target_runtime.register(&mut target_environment, &LuaRuntime::runtime());
 
         target_environment
             .add_template("t", "{{ shout(name) }}-{{ brand }}")
@@ -1254,7 +1239,7 @@ mod tests {
 
         let mut target_environment = Environment::new();
 
-        target_module.register(&mut target_environment, &LuaRuntime::block_runtime());
+        target_module.register(&mut target_environment, &LuaRuntime::runtime());
 
         target_environment
             .add_template("t", "{{ slow(name) }}")
@@ -1298,7 +1283,7 @@ mod tests {
 
         let mut target_environment = Environment::new();
 
-        target_runtime.register(&mut target_environment, &LuaRuntime::block_runtime());
+        target_runtime.register(&mut target_environment, &LuaRuntime::runtime());
 
         target_environment
             .add_template("t", "{{ greeting }}")
@@ -1364,7 +1349,7 @@ mod tests {
             .eval::<mlua::Value>()
             .unwrap();
 
-        let target_value = MirageValue::try_from(target_value).unwrap().into_value();
+        let target_value = MirageValue::try_from(target_value).unwrap().value();
 
         assert_eq!(
             target_value.get_attr("left").unwrap(),
@@ -1393,7 +1378,7 @@ mod tests {
 
         assert!(
             conversion
-                .convert_value(mlua::Value::Table(target_table.clone()), 0)
+                .value(mlua::Value::Table(target_table.clone()), 0)
                 .is_err()
         );
 
@@ -1401,7 +1386,7 @@ mod tests {
         target_table.set("good", 7).unwrap();
 
         let target_value = conversion
-            .convert_value(mlua::Value::Table(target_table), 0)
+            .value(mlua::Value::Table(target_table), 0)
             .unwrap();
 
         assert_eq!(
@@ -1454,7 +1439,7 @@ mod tests {
             .call::<mlua::Value>(MirageValue(target_value))
             .unwrap();
 
-        let target_result = MirageValue::try_from(target_result).unwrap().into_value();
+        let target_result = MirageValue::try_from(target_result).unwrap().value();
 
         assert_eq!(target_result, minijinja::Value::from(vec!["data", "value"]));
     }
@@ -1474,7 +1459,7 @@ mod tests {
             .call::<mlua::Value>(MirageValue(target_value))
             .unwrap();
 
-        let target_result = MirageValue::try_from(target_result).unwrap().into_value();
+        let target_result = MirageValue::try_from(target_result).unwrap().value();
 
         assert_eq!(
             target_result.get_attr("original").unwrap(),

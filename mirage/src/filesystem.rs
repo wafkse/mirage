@@ -43,7 +43,7 @@ impl ExpandedPath {
     /// Consume the expanded input and return its filesystem path.
     #[inline]
     #[must_use]
-    pub fn into_path(self) -> PathBuf {
+    pub fn path(self) -> PathBuf {
         let Self(target_path) = self;
 
         target_path

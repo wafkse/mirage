@@ -1,7 +1,7 @@
 //! Manifest resolution and daemon lifecycle.
 //!
 //! [`Mirage::new`] constructs the configure, hydration, and control subsystems from [`MirageCli`]
-//! and the manifest. [`Mirage::render_oneshot`] uses the same settings for a synchronous render.
+//! and the manifest. [`Mirage::oneshot`] uses the same settings for a synchronous render.
 
 use std::{env::home_dir, path::PathBuf, time::Duration};
 
@@ -113,7 +113,7 @@ impl Resolved {
             ..
         } = target_settings;
 
-        let configure_root = ExpandedPath::new(command_configure)?.into_path();
+        let configure_root = ExpandedPath::new(command_configure)?.path();
 
         let Manifest {
             configure:
@@ -141,7 +141,7 @@ impl Resolved {
                 .or(manifest_template)
                 .ok_or_else(|| eyre!("no template dir provided"))?,
         )?
-        .into_path();
+        .path();
 
         let profile = command_profile
             .or(manifest_profile)
@@ -153,7 +153,7 @@ impl Resolved {
             .map(|module_path| -> eyre::Result<ModuleSource> {
                 let configure_root = configure_root.clone();
 
-                let module_path = ExpandedPath::new(module_path)?.into_path();
+                let module_path = ExpandedPath::new(module_path)?.path();
 
                 let manifest = manifest_module.clone();
 
@@ -169,7 +169,7 @@ impl Resolved {
             .or(manifest_sock)
             .map(ExpandedPath::new)
             .transpose()?
-            .map(ExpandedPath::into_path);
+            .map(ExpandedPath::path);
 
         let template_extension =
             manifest_extension.unwrap_or_else(|| manifest::DEFAULT_TEMPLATE_EXTENSION.to_string());
@@ -302,9 +302,9 @@ impl Mirage {
         let lua_runtime = module_source.as_ref().map(ModuleSource::load).transpose()?;
 
         let target_context =
-            ConfigureState::fold_context(configure_root.as_path(), &candidate_list, &profile)?;
+            ConfigureState::fold(configure_root.as_path(), &candidate_list, &profile)?;
 
-        HydrationState::render_once(
+        HydrationState::oneshot(
             lua_runtime.as_ref(),
             template_root.as_path(),
             template_extension.as_str(),
@@ -336,19 +336,13 @@ impl Background for Mirage {
 
         let mut terminate_signal = signal(SignalKind::terminate())?;
 
-        'a: {
-            tokio::select!(
-                // NOTE: The label targets this result block across `tokio::select!` expansion.
-                Ok(..) = signal::ctrl_c() => break 'a Ok(()),
-                Some(..) = terminate_signal.recv() => break 'a Ok(()),
-                target_value = thread_set.join_all() => {
-                    for target_value in target_value {
-                        target_value?;
-                    }
-
-                    Ok(())
-                },
-            )
-        }
+        tokio::select!(
+            target_result = signal::ctrl_c() => target_result.map_err(eyre::Report::from),
+            Some(()) = terminate_signal.recv() => Ok(()),
+            target_result = thread_set.join_next() => match target_result {
+                Some(target_result) => target_result?,
+                None => Ok(()),
+            },
+        )
     }
 }

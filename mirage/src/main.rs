@@ -12,6 +12,8 @@
 
 use clap::Parser;
 
+use std::process::ExitCode;
+
 use tracing_subscriber::EnvFilter;
 
 use mirage::server::{Mirage, MirageCli};
@@ -27,8 +29,8 @@ struct Application {
 }
 
 impl Application {
-    /// Run the requested rendering mode and report terminal failures.
-    fn run(self) {
+    /// Run the requested mode and report terminal failures with a failure exit status.
+    fn run(self) -> ExitCode {
         let Self { settings } = self;
 
         let MirageCli { oneshot, .. } = &settings;
@@ -39,8 +41,13 @@ impl Application {
             Self::daemon(settings)
         };
 
-        if let Err(target_value) = target_result {
-            Self::report(&target_value);
+        match target_result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(target_value) => {
+                Self::report(&target_value);
+
+                ExitCode::FAILURE
+            }
         }
     }
 
@@ -74,10 +81,10 @@ impl Application {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     Application::tracing();
 
     let settings = MirageCli::parse();
 
-    Application { settings }.run();
+    Application { settings }.run()
 }
