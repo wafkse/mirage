@@ -1,5 +1,6 @@
 //! Path expansion and asynchronous delivery of filesystem events.
 //!
+//! [`ExpandedPath`] resolves shell expressions in daemon path inputs.
 //! [`FsWatcher`] retains a platform watcher and receives its successful events through a channel.
 
 use std::ops::Deref;
@@ -13,30 +14,40 @@ use notify::{Event, EventHandler, RecommendedWatcher};
 
 use tokio::sync::mpsc;
 
-/// Apply shell-style expansion to a path-bearing string.
+/// A daemon path after shell-style expansion of its input expression.
 ///
-/// Expand a leading `~` and `$VAR` or `${VAR}` environment references in a daemon path input.
-///
-/// # Errors
-///
-/// Returns an error when a referenced environment variable cannot be resolved.
-#[inline]
-pub fn shell_expand_str(target_path: &str) -> eyre::Result<String> {
-    shellexpand::full(target_path)
-        .map(std::borrow::Cow::into_owned)
-        .wrap_err_with(|| format!("could not expand path `{target_path}`"))
-}
+/// Construction expands a leading `~` and environment references through `shellexpand`.
+// NOTE(invariant): None.
+#[derive(Debug, Clone)]
+pub struct ExpandedPath(PathBuf);
 
-/// Apply shell-style expansion to the lossy UTF-8 representation of a path.
-///
-/// This is the [`Path`]-typed counterpart of [`shell_expand_str`], used for the daemon's `-C`/`-T`/`-L` inputs.
-///
-/// # Errors
-///
-/// Returns an error when a referenced environment variable cannot be resolved.
-#[inline]
-pub fn shell_expand(target_path: impl AsRef<Path>) -> eyre::Result<PathBuf> {
-    shell_expand_str(target_path.as_ref().to_string_lossy().as_ref()).map(PathBuf::from)
+impl ExpandedPath {
+    /// Expand a path expression after conversion to its lossy UTF-8 representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a referenced environment variable cannot be resolved.
+    #[inline]
+    pub fn new(target_path: impl AsRef<Path>) -> eyre::Result<Self> {
+        let target_path = target_path.as_ref().to_string_lossy();
+
+        let target_value = shellexpand::full(&target_path)
+            .map(std::borrow::Cow::into_owned)
+            .wrap_err_with(|| format!("could not expand path `{target_path}`"))?;
+
+        let target_value = PathBuf::from(target_value);
+
+        Ok(Self(target_value))
+    }
+
+    /// Consume the expanded input and return its filesystem path.
+    #[inline]
+    #[must_use]
+    pub fn into_path(self) -> PathBuf {
+        let Self(target_path) = self;
+
+        target_path
+    }
 }
 
 /// A platform watcher with a channel for successful filesystem events.

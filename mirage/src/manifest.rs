@@ -17,7 +17,7 @@ use figment::{
 
 use glob::glob;
 
-use crate::filesystem;
+use crate::filesystem::ExpandedPath;
 
 /// The format used for configure candidates in the daemon.
 pub type DefaultFormat = Toml;
@@ -163,7 +163,7 @@ impl ManifestCandidate {
         let mut target_list = Vec::new();
 
         // NOTE: Absolute paths produced by expansion supply their own root for glob matching.
-        let expanded_path = filesystem::shell_expand_str(path)?;
+        let expanded_path = ExpandedPath::new(path)?.into_path();
 
         for target_value in glob(
             relative_root

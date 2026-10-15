@@ -27,14 +27,12 @@ use tracing::Instrument;
 
 use crate::{
     background::Background,
-    filesystem,
-    manifest::{
-        self, Manifest, ManifestCandidate, ManifestConfigure, ManifestModule, UndefinedKind,
-    },
+    filesystem::ExpandedPath,
+    manifest::{self, Manifest, ManifestCandidate, ManifestConfigure, UndefinedKind},
     state::{
-        configure::{self, ConfigurePipe, ConfigureState},
+        configure::{ConfigurePipe, ConfigureState},
         control::ControlState,
-        hydrate::{self, HydrationState, ModuleSource},
+        hydrate::{HydrationState, ModuleSource},
     },
 };
 
@@ -97,87 +95,102 @@ struct Resolved {
     listen_sock: Option<PathBuf>,
 }
 
-/// Resolve the command line, manifest, and defaults into [`Resolved`] settings.
-///
-/// Expand the configure root before loading `.mirage.toml`, then expand the selected template,
-/// socket, and module paths. Manifest environment overrides use the `MIRAGE_MANIFEST_` prefix.
-///
-/// # Errors
-///
-/// Returns an error when the manifest cannot be loaded, a path fails to expand, or no template directory is provided.
-fn resolve(target_settings: MirageCli) -> eyre::Result<Resolved> {
-    let MirageCli {
-        configure: command_configure,
-        profile: command_profile,
-        template_root: command_template,
-        listen_sock: command_sock,
-        ..
-    } = target_settings;
+impl Resolved {
+    /// Resolve the command line, manifest, and defaults into [`Resolved`] settings.
+    ///
+    /// Expand the configure root before loading `.mirage.toml`, then expand the selected template,
+    /// socket, and module paths. Manifest environment overrides use the `MIRAGE_MANIFEST_` prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest cannot be loaded, a path fails to expand, or no template directory is provided.
+    fn new(target_settings: MirageCli) -> eyre::Result<Self> {
+        let MirageCli {
+            configure: command_configure,
+            profile: command_profile,
+            template_root: command_template,
+            listen_sock: command_sock,
+            ..
+        } = target_settings;
 
-    let configure_root = filesystem::shell_expand(command_configure)?;
+        let configure_root = ExpandedPath::new(command_configure)?.into_path();
 
-    let Manifest {
-        configure:
-            ManifestConfigure {
-                template: manifest_template,
-                listen_sock: manifest_sock,
-                profile: manifest_profile,
-                module: manifest_module_path,
-                template_extension: manifest_extension,
-                undefined: manifest_undefined,
-                notificate_period: manifest_period,
-            },
-        candidate: candidate_list,
-        module: manifest_module,
-    } = Figment::new()
-        .merge(Toml::file(
-            configure_root.join(Mirage::MIRAGE_MANIFEST_DOTFILE),
-        ))
-        // NOTE: Manifest environment overrides concatenate arrays through `Figment::admerge`.
-        .admerge(Env::prefixed("MIRAGE_MANIFEST_"))
-        .extract::<Manifest>()?;
+        let Manifest {
+            configure:
+                ManifestConfigure {
+                    template: manifest_template,
+                    listen_sock: manifest_sock,
+                    profile: manifest_profile,
+                    module: manifest_module_path,
+                    template_extension: manifest_extension,
+                    undefined: manifest_undefined,
+                    notificate_period: manifest_period,
+                },
+            candidate: candidate_list,
+            module: manifest_module,
+        } = Figment::new()
+            .merge(Toml::file(
+                configure_root.join(Mirage::MIRAGE_MANIFEST_DOTFILE),
+            ))
+            // NOTE: Manifest environment overrides concatenate arrays through `Figment::admerge`.
+            .admerge(Env::prefixed("MIRAGE_MANIFEST_"))
+            .extract::<Manifest>()?;
 
-    let template_root = filesystem::shell_expand(
-        command_template
-            .or(manifest_template)
-            .ok_or_else(|| eyre!("no template dir provided"))?,
-    )?;
+        let template_root = ExpandedPath::new(
+            command_template
+                .or(manifest_template)
+                .ok_or_else(|| eyre!("no template dir provided"))?,
+        )?
+        .into_path();
 
-    let profile = command_profile
-        .or(manifest_profile)
-        .map_or(Profile::Default, |target_profile| {
-            Profile::new(target_profile.as_str())
-        });
+        let profile = command_profile
+            .or(manifest_profile)
+            .map_or(Profile::Default, |target_profile| {
+                Profile::new(target_profile.as_str())
+            });
 
-    let module_source = manifest_module_path
-        .map(|module_path| -> eyre::Result<ModuleSource> {
-            Ok(ModuleSource {
-                configure_root: configure_root.clone(),
-                module_path: filesystem::shell_expand(module_path)?,
-                manifest: ManifestModule::clone(&manifest_module),
+        let module_source = manifest_module_path
+            .map(|module_path| -> eyre::Result<ModuleSource> {
+                let configure_root = configure_root.clone();
+
+                let module_path = ExpandedPath::new(module_path)?.into_path();
+
+                let manifest = manifest_module.clone();
+
+                Ok(ModuleSource {
+                    configure_root,
+                    module_path,
+                    manifest,
+                })
             })
+            .transpose()?;
+
+        let listen_sock = command_sock
+            .or(manifest_sock)
+            .map(ExpandedPath::new)
+            .transpose()?
+            .map(ExpandedPath::into_path);
+
+        let template_extension =
+            manifest_extension.unwrap_or_else(|| manifest::DEFAULT_TEMPLATE_EXTENSION.to_string());
+
+        let undefined = manifest_undefined.unwrap_or_default();
+
+        let notificate_period =
+            Duration::from_millis(manifest_period.unwrap_or(manifest::DEFAULT_NOTIFICATE_PERIOD));
+
+        Ok(Self {
+            configure_root,
+            candidate_list,
+            profile,
+            template_root,
+            template_extension,
+            undefined,
+            notificate_period,
+            module_source,
+            listen_sock,
         })
-        .transpose()?;
-
-    let listen_sock = command_sock
-        .or(manifest_sock)
-        .map(filesystem::shell_expand)
-        .transpose()?;
-
-    Ok(Resolved {
-        configure_root,
-        candidate_list,
-        profile,
-        template_root,
-        template_extension: manifest_extension
-            .unwrap_or_else(|| manifest::DEFAULT_TEMPLATE_EXTENSION.to_string()),
-        undefined: manifest_undefined.unwrap_or_default(),
-        notificate_period: Duration::from_millis(
-            manifest_period.unwrap_or(manifest::DEFAULT_NOTIFICATE_PERIOD),
-        ),
-        module_source,
-        listen_sock,
-    })
+    }
 }
 
 /// The configure, hydration, and control subsystems of a daemon instance.
@@ -229,7 +242,7 @@ impl Mirage {
             notificate_period,
             module_source,
             listen_sock,
-        } = resolve(target_settings)?;
+        } = Resolved::new(target_settings)?;
 
         let configure_state =
             ConfigureState::new((configure_root.as_path(), candidate_list), profile)?;
@@ -274,7 +287,7 @@ impl Mirage {
     /// Returns an error when the manifest cannot be loaded, a path fails to expand, the module fails to evaluate, or the
     /// render itself fails.
     #[inline]
-    pub fn render_oneshot(target_settings: MirageCli) -> eyre::Result<()> {
+    pub fn oneshot(target_settings: MirageCli) -> eyre::Result<()> {
         let Resolved {
             configure_root,
             candidate_list,
@@ -284,14 +297,14 @@ impl Mirage {
             undefined,
             module_source,
             ..
-        } = resolve(target_settings)?;
+        } = Resolved::new(target_settings)?;
 
         let lua_runtime = module_source.as_ref().map(ModuleSource::load).transpose()?;
 
         let target_context =
-            configure::fold_context(configure_root.as_path(), &candidate_list, &profile)?;
+            ConfigureState::fold_context(configure_root.as_path(), &candidate_list, &profile)?;
 
-        hydrate::render_once(
+        HydrationState::render_once(
             lua_runtime.as_ref(),
             template_root.as_path(),
             template_extension.as_str(),

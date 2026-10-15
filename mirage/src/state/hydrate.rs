@@ -24,7 +24,7 @@ use walkdir::WalkDir;
 use crate::{
     background::Background,
     filesystem::FsWatcher,
-    lua::{self, LuaRuntime},
+    lua::{LuaRuntime, MirageValue},
     manifest::{ManifestModule, UndefinedKind},
 };
 
@@ -182,15 +182,17 @@ impl HydrationState {
             "hydration worker started",
         );
 
+        let template_tree = TemplateTree::new(template_root, template_extension);
+
         loop {
-            let target_event = target_runtime.block_on(next_event(
+            let target_event = target_runtime.block_on(Self::next_event(
                 &mut watcher_template,
                 &mut watcher_module,
                 &mut context_pipe,
             ));
 
             let (target_change, mut reload_module) = if start_hydrate {
-                classify_event(&target_event, &template_extension)
+                target_event.classify(template_tree.extension())
             } else {
                 start_hydrate = true;
 
@@ -212,7 +214,7 @@ impl HydrationState {
 
                     while let Ok(extra_event) = tokio::time::timeout(
                         notificate_period,
-                        next_event(
+                        Self::next_event(
                             &mut watcher_template,
                             &mut watcher_module,
                             &mut context_pipe,
@@ -220,7 +222,7 @@ impl HydrationState {
                     )
                     .await
                     {
-                        let (.., extra_reload) = classify_event(&extra_event, &template_extension);
+                        let (.., extra_reload) = extra_event.classify(template_tree.extension());
 
                         reload_module |= extra_reload;
 
@@ -239,25 +241,24 @@ impl HydrationState {
 
                 match target_source.load() {
                     Ok(target_module) => lua_runtime = Some(target_module),
-                    Err(target_error) => report_error(&target_error),
+                    Err(target_error) => Self::report_error(&target_error),
                 }
             }
 
-            let temp_filedir = tempdir_in(template_root.as_path())?;
+            let temp_filedir = tempdir_in(template_tree.root())?;
 
-            let target_value = render(
+            let renderer = Renderer::new(
                 &target_runtime,
                 lua_runtime.as_ref(),
-                template_root.as_path(),
-                template_extension.as_str(),
+                &template_tree,
                 undefined,
-                &context_pipe.borrow(),
-                &temp_filedir,
             );
 
+            let target_value = renderer.render(&context_pipe.borrow(), temp_filedir);
+
             match target_value {
-                Ok(rename_list) => commit_renames(rename_list)?,
-                Err(target_error) => report_error(&target_error),
+                Ok(staged_render) => staged_render.commit()?,
+                Err(target_error) => Self::report_error(&target_error),
             }
         }
     }
@@ -299,291 +300,403 @@ impl Background for HydrationState {
     }
 }
 
-/// Await the next hydration event across the template watcher, the optional module watcher, and the context pipe.
-async fn next_event(
-    watcher_template: &mut FsWatcher,
-    watcher_module: &mut Option<FsWatcher>,
-    context_pipe: &mut watch::Receiver<toml::Value>,
-) -> HydrationEvent {
-    let module_event = async {
-        // NOTE: With no module watcher, this future remains pending.
-        match watcher_module.as_mut() {
-            Some(target_watch) => target_watch.receiver_mut().recv().await,
-            None => std::future::pending().await,
-        }
-    };
-
-    tokio::select!(
-        Some(target_event) = watcher_template.receiver_mut().recv() => HydrationEvent::Template(target_event),
-        Some(target_event) = module_event => HydrationEvent::Module(target_event),
-        Ok(..) = context_pipe.changed() => HydrationEvent::Context,
-    )
-}
-
-/// Classify an event into whether it forces a render and whether it forces a module-VM rebuild.
-fn classify_event(target_event: &HydrationEvent, template_extension: &str) -> (bool, bool) {
-    match target_event {
-        HydrationEvent::Template(notify::Event {
-            kind:
-                notify::EventKind::Modify(
-                    notify::event::ModifyKind::Name(..) | notify::event::ModifyKind::Data(..),
-                )
-                | notify::EventKind::Create(notify::event::CreateKind::File)
-                | notify::EventKind::Remove(notify::event::RemoveKind::File),
-            paths: path_list,
-            ..
-        }) => (paths_bear_extension(path_list, template_extension), false),
-        HydrationEvent::Module(notify::Event {
-            kind:
-                notify::EventKind::Modify(
-                    notify::event::ModifyKind::Name(..) | notify::event::ModifyKind::Data(..),
-                )
-                | notify::EventKind::Create(notify::event::CreateKind::File)
-                | notify::EventKind::Remove(notify::event::RemoveKind::File),
-            paths: path_list,
-            ..
-        }) => {
-            let target_change = paths_bear_extension(path_list, "luau");
-
-            (target_change, target_change)
-        }
-        HydrationEvent::Context => (true, false),
-        _ => (false, false),
-    }
-}
-
-/// Construct a fresh [`Environment`] over the current template tree and module registrations.
-///
-/// Each pass loads current template contents and registers exports from the retained Luau VM.
-/// Registered callables capture the worker runtime to drive asynchronous module functions.
-fn build_environment(
-    target_runtime: &Arc<Runtime>,
-    lua_runtime: Option<&LuaRuntime>,
-    template_root: &Path,
-    undefined: UndefinedKind,
-) -> Environment<'static> {
-    let mut target_environment = Environment::new();
-
-    // NOTE: The loader accepts dotfiles and owns its root for the environment's `'static` lifetime.
-    target_environment.set_loader(file_loader(template_root.to_path_buf()));
-
-    target_environment.set_undefined_behavior(match undefined {
-        UndefinedKind::Strict => UndefinedBehavior::Strict,
-        UndefinedKind::Lenient => UndefinedBehavior::Lenient,
-        UndefinedKind::Chainable => UndefinedBehavior::Chainable,
-    });
-
-    if let Some(target_module) = lua_runtime {
-        target_module.register(&mut target_environment, target_runtime);
-    }
-
-    target_environment
-}
-
-/// Build a template loader rooted at the template directory that admits dot paths.
-///
-/// Names are checked by [`safe_join`] before reading. Filesystem reads follow symbolic links.
-fn file_loader(
-    template_root: PathBuf,
-) -> impl Fn(&str) -> Result<Option<String>, minijinja::Error> + Send + Sync + 'static {
-    move |target_name| {
-        let Some(target_path) = safe_join(template_root.as_path(), target_name) else {
-            return Ok(None);
+impl HydrationState {
+    /// Await the next hydration event across the template watcher, the optional module watcher, and the context pipe.
+    async fn next_event(
+        watcher_template: &mut FsWatcher,
+        watcher_module: &mut Option<FsWatcher>,
+        context_pipe: &mut watch::Receiver<toml::Value>,
+    ) -> HydrationEvent {
+        let module_event = async {
+            // NOTE: With no module watcher, this future remains pending.
+            match watcher_module.as_mut() {
+                Some(target_watch) => target_watch.receiver_mut().recv().await,
+                None => std::future::pending().await,
+            }
         };
 
-        match fs::read_to_string(target_path) {
-            Ok(target_source) => Ok(Some(target_source)),
-            Err(target_error) if target_error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(target_error) => Err(minijinja::Error::new(
-                ErrorKind::InvalidOperation,
-                "could not read template",
-            )
-            .with_source(target_error)),
-        }
+        tokio::select!(
+            Some(target_event) = watcher_template.receiver_mut().recv() => HydrationEvent::Template(target_event),
+            Some(target_event) = module_event => HydrationEvent::Module(target_event),
+            Ok(..) = context_pipe.changed() => HydrationEvent::Context,
+        )
+    }
+
+    /// Render every template once and commit the result, building a private runtime to drive any async module code.
+    ///
+    /// The current-thread runtime drives asynchronous Luau functions during rendering. Output files
+    /// are replaced individually after every template has rendered successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime cannot be built, a template fails to render, or a staged rename cannot be committed.
+    pub(crate) fn render_once(
+        lua_runtime: Option<&LuaRuntime>,
+        template_root: &Path,
+        template_extension: &str,
+        undefined: UndefinedKind,
+        target_context: &toml::Value,
+    ) -> eyre::Result<()> {
+        let _span = tracing::info_span!("oneshot").entered();
+
+        let target_runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
+        );
+
+        let template_tree = TemplateTree::new(template_root, template_extension);
+
+        let temp_filedir = tempdir_in(template_tree.root())?;
+
+        let renderer = Renderer::new(&target_runtime, lua_runtime, &template_tree, undefined);
+
+        renderer.render(target_context, temp_filedir)?.commit()
+    }
+
+    /// Log a render or module reload error chain through tracing.
+    ///
+    /// The worker continues waiting for input changes after these failures.
+    fn report_error(target_report: &eyre::Report) {
+        let target_chain = target_report
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        tracing::error!(causes = ?target_chain, "hydration pass failed");
     }
 }
 
-/// Join slash-separated template path segments onto the loader root.
-///
-/// Empty segments, `..`, and backslashes are rejected. Leading-dot filenames are accepted.
-/// Validation is lexical and filesystem reads can follow symbolic links outside the root.
-fn safe_join(template_root: &Path, target_name: &str) -> Option<PathBuf> {
-    let mut target_path = template_root.to_path_buf();
+impl HydrationEvent {
+    /// Classify an event into whether it forces a render and whether it forces a module-VM rebuild.
+    fn classify(&self, template_extension: &str) -> (bool, bool) {
+        match self {
+            HydrationEvent::Template(notify::Event {
+                kind:
+                    notify::EventKind::Modify(
+                        notify::event::ModifyKind::Name(..) | notify::event::ModifyKind::Data(..),
+                    )
+                    | notify::EventKind::Create(notify::event::CreateKind::File)
+                    | notify::EventKind::Remove(notify::event::RemoveKind::File),
+                paths: path_list,
+                ..
+            }) => (
+                Self::paths_bear_extension(path_list, template_extension),
+                false,
+            ),
+            HydrationEvent::Module(notify::Event {
+                kind:
+                    notify::EventKind::Modify(
+                        notify::event::ModifyKind::Name(..) | notify::event::ModifyKind::Data(..),
+                    )
+                    | notify::EventKind::Create(notify::event::CreateKind::File)
+                    | notify::EventKind::Remove(notify::event::RemoveKind::File),
+                paths: path_list,
+                ..
+            }) => {
+                let target_change = Self::paths_bear_extension(path_list, "luau");
 
-    for target_segment in target_name.split('/') {
-        if target_segment.is_empty() || target_segment == ".." || target_segment.contains('\\') {
-            return None;
+                (target_change, target_change)
+            }
+            HydrationEvent::Context => (true, false),
+            _ => (false, false),
         }
-
-        target_path.push(target_segment);
     }
 
-    Some(target_path)
+    /// Determine whether every path in an event has the supplied extension.
+    ///
+    /// Extension matching is case insensitive. An empty path list returns `true`.
+    fn paths_bear_extension(path_list: &[PathBuf], target_extension: &str) -> bool {
+        path_list.iter().all(|target_path| {
+            target_path
+                .extension()
+                .is_some_and(|target_value| target_value.eq_ignore_ascii_case(target_extension))
+        })
+    }
 }
 
-/// Enumerate the loader-relative names of every template candidate under the template root.
-fn template_names(template_root: &Path, template_extension: &str) -> eyre::Result<Vec<String>> {
-    let mut target_list = Vec::new();
+/// Template discovery and loader paths rooted in a directory.
+// NOTE(invariant): None.
+#[derive(Debug, Clone)]
+struct TemplateTree {
+    /// Directory containing source templates and generated outputs.
+    template_root: PathBuf,
 
-    for target_entry in WalkDir::new(template_root)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !target_entry.file_type().is_file() {
-            continue;
+    /// Filename extension used for template discovery and event filtering.
+    template_extension: String,
+}
+
+impl TemplateTree {
+    /// Retain the template root and filename extension.
+    fn new(template_root: impl AsRef<Path>, template_extension: impl Into<String>) -> Self {
+        let template_root = template_root.as_ref().to_path_buf();
+
+        let template_extension = template_extension.into();
+
+        Self {
+            template_root,
+            template_extension,
         }
-
-        let target_path = target_entry.path();
-
-        let target_match = target_path
-            .extension()
-            .is_some_and(|target_value| target_value.eq_ignore_ascii_case(template_extension));
-
-        if !target_match {
-            continue;
-        }
-
-        let target_name = target_path
-            .strip_prefix(template_root)?
-            .to_string_lossy()
-            .into_owned();
-
-        target_list.push(target_name);
     }
 
-    Ok(target_list)
+    /// Borrow the directory containing template inputs and staged output.
+    const fn root(&self) -> &PathBuf {
+        let Self { template_root, .. } = self;
+
+        template_root
+    }
+
+    /// Borrow the filename extension used to identify templates.
+    fn extension(&self) -> &str {
+        let Self {
+            template_extension, ..
+        } = self;
+
+        template_extension
+    }
+
+    /// Build a template loader rooted at the template directory that admits dot paths.
+    ///
+    /// Names are checked by [`Self::join`] before reading. Filesystem reads follow symbolic links.
+    fn loader(
+        &self,
+    ) -> impl Fn(&str) -> Result<Option<String>, minijinja::Error> + Send + Sync + 'static {
+        let template_tree = self.clone();
+
+        move |target_name| {
+            let Some(target_path) = template_tree.join(target_name) else {
+                return Ok(None);
+            };
+
+            match fs::read_to_string(target_path) {
+                Ok(target_source) => Ok(Some(target_source)),
+                Err(target_error) if target_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(None)
+                }
+                Err(target_error) => Err(minijinja::Error::new(
+                    ErrorKind::InvalidOperation,
+                    "could not read template",
+                )
+                .with_source(target_error)),
+            }
+        }
+    }
+
+    /// Join slash-separated template path segments onto the loader root.
+    ///
+    /// Empty segments, `..`, and backslashes are rejected. Leading-dot filenames are accepted.
+    /// Validation is lexical and filesystem reads can follow symbolic links outside the root.
+    fn join(&self, target_name: &str) -> Option<PathBuf> {
+        let Self { template_root, .. } = self;
+
+        let mut target_path = template_root.clone();
+
+        for target_segment in target_name.split('/') {
+            if target_segment.is_empty() || target_segment == ".." || target_segment.contains('\\')
+            {
+                return None;
+            }
+
+            target_path.push(target_segment);
+        }
+
+        Some(target_path)
+    }
+
+    /// Enumerate the loader-relative names of every template candidate under the template root.
+    fn names(&self) -> eyre::Result<Vec<String>> {
+        let Self {
+            template_root,
+            template_extension,
+        } = self;
+
+        let mut target_list = Vec::new();
+
+        for target_entry in WalkDir::new(template_root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !target_entry.file_type().is_file() {
+                continue;
+            }
+
+            let target_path = target_entry.path();
+
+            let target_match = target_path
+                .extension()
+                .is_some_and(|target_value| target_value.eq_ignore_ascii_case(template_extension));
+
+            if !target_match {
+                continue;
+            }
+
+            let target_name = target_path
+                .strip_prefix(template_root)?
+                .to_string_lossy()
+                .into_owned();
+
+            target_list.push(target_name);
+        }
+
+        Ok(target_list)
+    }
 }
 
-/// Stage every rendered template and return the pending output renames.
-///
-/// An error during rendering or staging leaves destination files untouched. Each staged file
-/// receives its source template's permissions.
-fn render(
-    target_runtime: &Arc<Runtime>,
-    lua_runtime: Option<&LuaRuntime>,
-    template_root: &Path,
-    template_extension: &str,
+/// Rendering inputs borrowed for a pass through the template tree.
+// NOTE(invariant): None.
+#[derive(Debug)]
+struct Renderer<'render> {
+    /// Runtime used by registered asynchronous Luau callables.
+    target_runtime: &'render Arc<Runtime>,
+
+    /// Evaluated module exports available during this pass.
+    lua_runtime: Option<&'render LuaRuntime>,
+
+    /// Source template tree and output naming rules.
+    template_tree: &'render TemplateTree,
+
+    /// Handling of undefined values in the template environment.
     undefined: UndefinedKind,
-    target_context: &toml::Value,
-    temp_filedir: &TempDir,
-) -> eyre::Result<Vec<(PathBuf, PathBuf)>> {
-    let target_environment =
-        build_environment(target_runtime, lua_runtime, template_root, undefined);
+}
 
-    let target_context = lua::toml_to_minijinja(target_context);
-
-    let mut rename_list = Vec::new();
-
-    for template_name in template_names(template_root, template_extension)? {
-        let mut template_path = template_root.join(template_name.as_str());
-
-        let template_perms = fs::metadata(template_path.as_path())?.permissions();
-
-        let mut temp_path = temp_filedir.path().join(template_name.as_str());
-
-        let _ = template_path.set_extension("");
-        let _ = temp_path.set_extension("");
-
-        fs::create_dir_all(
-            temp_path
-                .parent()
-                .ok_or_else(|| eyre!("tempfile does not have a parent"))?,
-        )?;
-
-        let rendered_output = target_environment
-            .get_template(template_name.as_str())?
-            .render(&target_context)?;
-
-        fs::write(temp_path.as_path(), rendered_output)?;
-
-        fs::set_permissions(temp_path.as_path(), template_perms)?;
-
-        tracing::trace!(template = %template_name, "staged template");
-
-        rename_list.push((temp_path, template_path));
+impl<'render> Renderer<'render> {
+    /// Borrow the runtime, module exports, and template settings for a render pass.
+    const fn new(
+        target_runtime: &'render Arc<Runtime>,
+        lua_runtime: Option<&'render LuaRuntime>,
+        template_tree: &'render TemplateTree,
+        undefined: UndefinedKind,
+    ) -> Self {
+        Self {
+            target_runtime,
+            lua_runtime,
+            template_tree,
+            undefined,
+        }
     }
 
-    tracing::info!(rendered = rename_list.len(), "render pass staged");
+    /// Construct a fresh [`Environment`] over the current template tree and module registrations.
+    ///
+    /// Each pass loads current template contents and registers exports from the retained Luau VM.
+    /// Registered callables capture the worker runtime to drive asynchronous module functions.
+    fn environment(&self) -> Environment<'static> {
+        let Self {
+            target_runtime,
+            lua_runtime,
+            template_tree,
+            undefined,
+        } = self;
 
-    Ok(rename_list)
-}
+        let mut target_environment = Environment::new();
 
-/// Replace destination files with the staged renders in order.
-///
-/// Each successful rename atomically replaces its destination on the same filesystem. A failed
-/// rename returns an error, leaving earlier replacements in place and later outputs unchanged.
-fn commit_renames(rename_list: Vec<(PathBuf, PathBuf)>) -> eyre::Result<()> {
-    for (from, to) in rename_list {
-        fs::rename(from, to)?;
+        // NOTE: The loader accepts dotfiles and owns its root for the environment's `'static` lifetime.
+        target_environment.set_loader(template_tree.loader());
+
+        target_environment.set_undefined_behavior(match undefined {
+            UndefinedKind::Strict => UndefinedBehavior::Strict,
+            UndefinedKind::Lenient => UndefinedBehavior::Lenient,
+            UndefinedKind::Chainable => UndefinedBehavior::Chainable,
+        });
+
+        if let Some(target_module) = lua_runtime {
+            target_module.register(&mut target_environment, target_runtime);
+        }
+
+        target_environment
     }
 
-    Ok(())
+    /// Stage every rendered template and return the pending output renames.
+    ///
+    /// An error during rendering or staging leaves destination files untouched. Each staged file
+    /// receives its source template's permissions.
+    fn render(
+        &self,
+        target_context: &toml::Value,
+        temp_filedir: TempDir,
+    ) -> eyre::Result<StagedRender> {
+        let Self { template_tree, .. } = self;
+
+        let target_environment = self.environment();
+
+        let target_context = MirageValue::from(target_context).into_value();
+
+        let mut rename_list = Vec::new();
+
+        for template_name in template_tree.names()? {
+            let mut template_path = template_tree.root().join(template_name.as_str());
+
+            let template_perms = fs::metadata(template_path.as_path())?.permissions();
+
+            let mut temp_path = temp_filedir.path().join(template_name.as_str());
+
+            let _ = template_path.set_extension("");
+            let _ = temp_path.set_extension("");
+
+            fs::create_dir_all(
+                temp_path
+                    .parent()
+                    .ok_or_else(|| eyre!("tempfile does not have a parent"))?,
+            )?;
+
+            let rendered_output = target_environment
+                .get_template(template_name.as_str())?
+                .render(&target_context)?;
+
+            fs::write(temp_path.as_path(), rendered_output)?;
+
+            fs::set_permissions(temp_path.as_path(), template_perms)?;
+
+            tracing::trace!(template = %template_name, "staged template");
+
+            rename_list.push((temp_path, template_path));
+        }
+
+        tracing::info!(rendered = rename_list.len(), "render pass staged");
+
+        Ok(StagedRender {
+            temp_filedir,
+            rename_list,
+        })
+    }
 }
 
-/// Render every template once and commit the result, building a private runtime to drive any async module code.
-///
-/// The current-thread runtime drives asynchronous Luau functions during rendering. Output files
-/// are replaced individually after every template has rendered successfully.
-///
-/// # Errors
-///
-/// Returns an error when the runtime cannot be built, a template fails to render, or a staged rename cannot be committed.
-pub(crate) fn render_once(
-    lua_runtime: Option<&LuaRuntime>,
-    template_root: &Path,
-    template_extension: &str,
-    undefined: UndefinedKind,
-    target_context: &toml::Value,
-) -> eyre::Result<()> {
-    let _span = tracing::info_span!("oneshot").entered();
+/// Rendered files retained in their staging directory until output replacement or drop.
+// NOTE(invariant): Every source path in `rename_list` belongs to `temp_filedir`.
+#[derive(Debug)]
+struct StagedRender {
+    /// Directory retaining the staged files for the lifetime of this pass.
+    temp_filedir: TempDir,
 
-    let target_runtime = Arc::new(
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?,
-    );
-
-    let temp_filedir = tempdir_in(template_root)?;
-
-    let rename_list = render(
-        &target_runtime,
-        lua_runtime,
-        template_root,
-        template_extension,
-        undefined,
-        target_context,
-        &temp_filedir,
-    )?;
-
-    commit_renames(rename_list)
+    /// Source and destination paths for individual output replacements.
+    rename_list: Vec<(PathBuf, PathBuf)>,
 }
 
-/// Determine whether every path in an event has the supplied extension.
-///
-/// Extension matching is case insensitive. An empty path list returns `true`.
-fn paths_bear_extension(path_list: &[PathBuf], target_extension: &str) -> bool {
-    path_list.iter().all(|target_path| {
-        target_path
-            .extension()
-            .is_some_and(|target_value| target_value.eq_ignore_ascii_case(target_extension))
-    })
-}
+impl StagedRender {
+    /// Replace destination files with the staged renders in order.
+    ///
+    /// Each successful rename atomically replaces its destination on the same filesystem. A failed
+    /// rename returns an error, leaving earlier replacements in place and later outputs unchanged.
+    fn commit(self) -> eyre::Result<()> {
+        let Self {
+            temp_filedir: _temp_filedir,
+            rename_list,
+        } = self;
 
-/// Log a render or module reload error chain through tracing.
-///
-/// The worker continues waiting for input changes after these failures.
-fn report_error(target_report: &eyre::Report) {
-    let target_chain = target_report
-        .chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+        for (from, to) in rename_list {
+            fs::rename(from, to)?;
+        }
 
-    tracing::error!(causes = ?target_chain, "hydration pass failed");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{file_loader, safe_join, template_names};
+    use super::{Renderer, TemplateTree};
+
+    use std::sync::Arc;
+
+    use crate::manifest::UndefinedKind;
 
     use std::path::Path;
 
@@ -603,7 +716,9 @@ mod tests {
 
         let mut target_environment = Environment::new();
 
-        target_environment.set_loader(file_loader(target_dir.path().to_path_buf()));
+        let template_tree = TemplateTree::new(target_dir.path(), "jinja");
+
+        target_environment.set_loader(template_tree.loader());
 
         assert_eq!(
             target_environment
@@ -631,7 +746,9 @@ mod tests {
         std::fs::write(target_dir.path().join(".config/app.conf.jinja"), "x").unwrap();
         std::fs::write(target_dir.path().join(".bashrc.jinja"), "x").unwrap();
 
-        let mut target_names = template_names(target_dir.path(), "jinja").unwrap();
+        let template_tree = TemplateTree::new(target_dir.path(), "jinja");
+
+        let mut target_names = template_tree.names().unwrap();
 
         target_names.sort();
 
@@ -642,12 +759,50 @@ mod tests {
     fn safe_join_permits_dots_but_refuses_traversal() {
         let target_root = Path::new("/srv/templates");
 
+        let template_tree = TemplateTree::new(target_root, "jinja");
+
         assert_eq!(
-            safe_join(target_root, ".config/app.conf.jinja"),
+            template_tree.join(".config/app.conf.jinja"),
             Some(target_root.join(".config/app.conf.jinja"))
         );
 
-        assert!(safe_join(target_root, "../escape").is_none());
-        assert!(safe_join(target_root, "nested/../escape").is_none());
+        assert!(template_tree.join("../escape").is_none());
+        assert!(template_tree.join("nested/../escape").is_none());
+    }
+
+    #[test]
+    fn staged_outputs_outlive_the_renderer_until_commit() {
+        let target_dir = tempfile::tempdir().unwrap();
+
+        let template_path = target_dir.path().join("app.conf.jinja");
+        let output_path = target_dir.path().join("app.conf");
+
+        std::fs::write(template_path, "{{ name }}").unwrap();
+
+        let staged = {
+            let target_runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+
+            let template_tree = TemplateTree::new(target_dir.path(), "jinja");
+
+            let renderer =
+                Renderer::new(&target_runtime, None, &template_tree, UndefinedKind::Strict);
+
+            let context = toml::from_str::<toml::Value>("name = 'mirage'").unwrap();
+
+            let temp_filedir = tempfile::tempdir_in(target_dir.path()).unwrap();
+
+            renderer.render(&context, temp_filedir).unwrap()
+        };
+
+        assert!(!output_path.exists());
+
+        staged.commit().unwrap();
+
+        assert_eq!(std::fs::read_to_string(output_path).unwrap(), "mirage");
     }
 }

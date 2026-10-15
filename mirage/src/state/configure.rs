@@ -1,7 +1,7 @@
 //! Candidate loading and publication of the active render context.
 //!
 //! [`ConfigureState`] watches the configure tree and selected profile. Relevant events rebuild
-//! the context through `fold_context` and publish it through [`ConfigurePipe`].
+//! the context through `ConfigureState::fold_context` and publish it through [`ConfigurePipe`].
 
 use std::{
     ops::Deref,
@@ -20,46 +20,6 @@ use crate::{
     filesystem::FsWatcher,
     manifest::{self, ManifestCandidate},
 };
-
-/// Combine configure candidates and select the active profile's render context.
-///
-/// Expand candidate patterns in manifest order, apply their merge policies, and overlay `MIRAGE_`
-/// environment values. Both daemon execution and one-shot rendering use this operation.
-///
-/// # Errors
-///
-/// Returns an error when a candidate path cannot be expanded or globbed, or when the folded tree fails to deserialize.
-pub(crate) fn fold_context(
-    candidate_tree: &Path,
-    manifest_candidates: &[ManifestCandidate],
-    context_profile: &Profile,
-) -> eyre::Result<toml::Value> {
-    let mut configure_list = Vec::new();
-
-    for target_value in manifest_candidates
-        .iter()
-        .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
-    {
-        configure_list.extend(target_value?);
-    }
-
-    tracing::debug!(
-        candidate_count = configure_list.len(),
-        profile = %context_profile,
-        "folding configure candidates",
-    );
-
-    let target_context = configure_list
-        .iter()
-        .fold(Figment::new(), |target_value: Figment, target_candidate| {
-            target_candidate.combine::<manifest::DefaultFormat>(target_value)
-        })
-        .merge(Env::prefixed("MIRAGE_"))
-        .select(context_profile.clone())
-        .extract::<toml::Value>()?;
-
-    Ok(target_context)
-}
 
 /// Senders for the render context and selected profile of a [`ConfigureState`].
 #[derive(Debug, Clone)]
@@ -142,7 +102,8 @@ impl ConfigureState {
             target_value
         };
 
-        let target_context = fold_context(candidate_tree, &manifest_candidates, &context_profile)?;
+        let target_context =
+            Self::fold_context(candidate_tree, &manifest_candidates, &context_profile)?;
 
         let (context_sender, ..) = watch::channel(target_context);
 
@@ -175,6 +136,46 @@ impl ConfigureState {
         let Self { configure_pipe, .. } = self;
 
         configure_pipe
+    }
+
+    /// Combine configure candidates and select the active profile's render context.
+    ///
+    /// Expand candidate patterns in manifest order, apply their merge policies, and overlay `MIRAGE_`
+    /// environment values. Both daemon execution and one-shot rendering use this operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a candidate path cannot be expanded or globbed, or when the folded tree fails to deserialize.
+    pub(crate) fn fold_context(
+        candidate_tree: &Path,
+        manifest_candidates: &[ManifestCandidate],
+        context_profile: &Profile,
+    ) -> eyre::Result<toml::Value> {
+        let mut configure_list = Vec::new();
+
+        for target_value in manifest_candidates
+            .iter()
+            .map(|target_candidate| target_candidate.resolve_at(candidate_tree))
+        {
+            configure_list.extend(target_value?);
+        }
+
+        tracing::debug!(
+            candidate_count = configure_list.len(),
+            profile = %context_profile,
+            "folding configure candidates",
+        );
+
+        let target_context = configure_list
+            .iter()
+            .fold(Figment::new(), |target_value: Figment, target_candidate| {
+                target_candidate.combine::<manifest::DefaultFormat>(target_value)
+            })
+            .merge(Env::prefixed("MIRAGE_"))
+            .select(context_profile.clone())
+            .extract::<toml::Value>()?;
+
+        Ok(target_context)
     }
 }
 
@@ -255,7 +256,7 @@ impl Background for ConfigureState {
             };
 
             if target_state {
-                let target_context = fold_context(
+                let target_context = Self::fold_context(
                     candidate_tree.as_path(),
                     &manifest_candidates,
                     &Profile::clone(profile_recv.borrow().deref()),
