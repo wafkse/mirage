@@ -146,9 +146,6 @@ with the accumulated data, with all policies merging tables recursively.
 | `fallback` | `join` | Existing value wins | Existing array retained |
 | `supplement` | `adjoin` | Existing value wins | Existing and candidate arrays concatenated |
 
-When migrating a manifest from an earlier revision that interchanged `append` and `fallback`, swap
-these policy names to preserve its previous merge results.
-
 After combining the configure files, Mirage merges environment values prefixed with `MIRAGE_`.
 The manifest itself accepts overrides through `MIRAGE_MANIFEST_`, whose merge concatenates arrays.
 
