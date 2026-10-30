@@ -309,3 +309,46 @@ fn fatal() {
     assert!(log.contains("render pass staged"));
     assert!(log.contains("mirage exited with an error"));
 }
+
+#[test]
+fn individual_candidates_expand_parametric_templates() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.path("configure/data/post")).unwrap();
+    fs::write(
+        fixture.path("configure/data/post/hello.toml"),
+        "[default.post.hello]\ntitle = 'Hello World'\ndate = 2026-10-20\nsource = 'content/hello.md'\n",
+    ).unwrap();
+    fs::write(
+        fixture.path("configure/data/post/mirage.toml"),
+        "[default.post.mirage]\ntitle = 'Building Mirage'\nrepository = 'url'\n",
+    )
+    .unwrap();
+    let manifest_path = fixture.path("configure/.mirage.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str("\n[[candidate]]\npath = 'data/post/*.toml'\npolicy = 'override'\n");
+    fs::write(manifest_path, manifest).unwrap();
+    fs::create_dir_all(fixture.path("templates/post/{post}")).unwrap();
+    fs::write(
+        fixture.path("templates/post/{post}/index.html.jinja"),
+        "{{ title }}:{{ repository|default('none') }}",
+    )
+    .unwrap();
+    let output = fixture.command().arg("--oneshot").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path("templates/result")).unwrap(),
+        "ready"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path("templates/post/hello/index.html")).unwrap(),
+        "Hello World:none"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.path("templates/post/mirage/index.html")).unwrap(),
+        "Building Mirage:url"
+    );
+}

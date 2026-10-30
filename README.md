@@ -1,24 +1,26 @@
 # Mirage
 
-Mirage renders application configuration from shared TOML data, combining Figment profiles with
-MiniJinja templates and Luau extensions. Each generated file is written beside its template, where
-the daemon keeps it up to date as inputs change or runtime updates arrive through `miragectl`.
+Mirage keeps application configuration in sync with shared TOML data. You describe values in
+profiles and use MiniJinja templates to turn those values into files. Run Mirage once to generate
+the files, or leave its daemon running to regenerate them when inputs change. While it runs,
+`miragectl` can select a different profile or update values in memory.
 
-Before replacing any destination files, Mirage renders and stages every output in the pass. Each
-replacement is atomic, although applications can observe different files changing at different
-times as the pass commits its results.
+Each output lives beside its template, so `terminal.toml.jinja` produces `terminal.toml`. This lets
+you keep templates in your application configuration directories while maintaining shared values
+in one place. For transformations that templates alone cannot express, Luau modules can supply
+functions, filters, and globals.
 
 Mirage is under active development and is intended for Linux desktop configurations.
 
-## Requirements
+## Setup
+
+Building Mirage requires the following tools and operating-system facilities.
 
 - stable Rust and Cargo
 - a C++17 toolchain for the bundled Luau runtime
 - filesystem notification support and Unix domain sockets
 - read access to configure files and templates
 - write access to the template directories and control socket location
-
-## Setup
 
 Build both binaries from the checkout with Cargo.
 
@@ -84,53 +86,22 @@ changes.
 mirage -C ~/.config/mirage
 ```
 
-While the daemon is running, select the `powersave` profile from another terminal to render with
-its values.
+While the daemon is running, select the `powersave` profile from another terminal. Its background
+overrides the default background, while the foreground remains `"#eeeeee"` because the selected
+profile inherits values it does not define.
 
 ```sh
 miragectl profile powersave
 ```
 
-## How it works
-
-The configure subsystem builds the render context by expanding candidate paths, combining their
-TOML data, and selecting the active Figment profile. Once resolved, the context is published to the
-hydration worker, which uses it to render the templates.
-
-For each pass, the worker discovers templates recursively and builds a MiniJinja environment with
-the configured Luau module's exports alongside the built-in functions and filters, including
-`tojson`. Rendering runs on a dedicated thread, where a Tokio runtime drives asynchronous Luau
-calls to completion.
-
-Discovery includes dot directories and uses `.jinja` as the default template extension. Mirage
-removes that extension to name the output, so `terminal.toml.jinja` produces `terminal.toml` beside
-the source with the same permissions. Every discovered template is rendered on each pass, including
-templates for large assets such as lookup tables.
-
-When relevant inputs change, the worker waits for the configured quiet interval before starting
-another pass. Further relevant events restart that interval, allowing a burst of changes to settle,
-while file reads and other irrelevant notifications leave it unchanged.
-
-## Rendering contract
-
-| Operation | Contract |
-| --- | --- |
-| Startup | Render the initial context before waiting for input events. |
-| Rendering | Stage every output before replacing destinations. A rendering or staging failure leaves existing outputs untouched. |
-| Replacement | Rename staged files individually. Each replacement is atomic on the same filesystem. A failed rename leaves earlier replacements in place and later outputs unchanged. |
-| Recovery | The daemon logs rendering failures and continues watching. Staging-directory creation and output-replacement failures terminate the daemon. |
-| Exit status | Successful one-shot rendering and shutdown through `SIGINT` or `SIGTERM` return `0`. One-shot errors and terminal daemon errors return `1`. |
-
-Since later passes replace generated output, keep persistent changes in templates and configure
-files and ignore generated paths in a dotfiles repository.
-
-Applications can reload their configuration through filesystem watchers or systemd path units
-that respond to generated file changes. These consumers receive notifications as individual files
-are replaced, so reloads can occur while other files in the pass are still awaiting replacement.
-
 ## Profiles and merge policies
 
-Top-level tables in configure files name profiles, which Figment composes in increasing order of
+Profiles let applications share defaults while changing selected values together. In the example,
+switching to `powersave` changes the background wherever a template uses `theme.background`.
+Additional candidate files can contribute values to those same profiles, allowing application
+settings to live in separate files without giving up a shared profile selection.
+
+Top-level tables in configure files name profiles. Their values combine in increasing order of
 precedence from `default` through the selected profile to `global`. This lets a selected profile
 override default values while values in `global` apply across profiles.
 
@@ -139,12 +110,12 @@ To assemble those profiles, Mirage evaluates candidate entries in manifest order
 again whenever the context is rebuilt. Each candidate's policy determines how its values combine
 with the accumulated data, with all policies merging tables recursively.
 
-| Policy | Figment operation | Conflicting scalars | Conflicting arrays |
-| --- | --- | --- | --- |
-| `override` | `merge` | Candidate wins | Candidate replaces existing array |
-| `append` | `admerge` | Candidate wins | Existing and candidate arrays concatenated |
-| `fallback` | `join` | Existing value wins | Existing array retained |
-| `supplement` | `adjoin` | Existing value wins | Existing and candidate arrays concatenated |
+| Policy | Conflicting scalars | Conflicting arrays |
+| --- | --- | --- |
+| `override` | Candidate wins | Candidate replaces existing array |
+| `append` | Candidate wins | Existing and candidate arrays concatenated |
+| `fallback` | Existing value wins | Existing array retained |
+| `supplement` | Existing value wins | Existing and candidate arrays concatenated |
 
 After combining the configure files, Mirage merges environment values prefixed with `MIRAGE_`.
 The manifest itself accepts overrides through `MIRAGE_MANIFEST_`, whose merge concatenates arrays.
@@ -156,7 +127,7 @@ where an option is available.
 
 | Key | Default | Command-line option | Meaning |
 | --- | --- | --- | --- |
-| `profile` | `"default"` | `-P`, `--profile` | Initially selected Figment profile. |
+| `profile` | `"default"` | `-P`, `--profile` | Initially selected profile. |
 | `template` | Required | `-T`, `--template` | Root containing templates and generated outputs. |
 | `listen-sock` | `~/.mirage.sock` | `-L`, `--listen` | Daemon control socket. |
 | `template-extension` | `"jinja"` | | Template extension, matched without regard to case. |
@@ -176,6 +147,116 @@ while relative template and socket paths resolve from the process's working dire
 Because manifest settings, candidate patterns, and environment overrides are loaded at startup,
 changing them requires a daemon restart. Matching configure files and `.luau` modules reload while
 the daemon is running.
+
+## Parametric templates
+
+An ordinary template produces one file from the full context. When a table describes several
+items, a parametric template can produce a file for each item instead. A path component such as
+`{post}` selects each immediate child of the resolved `post` table and renders with that child
+as its context.
+
+For example, a small site can keep shared settings in one file and individual posts in others.
+Start with this `.mirage.toml` in the project directory.
+
+```toml
+[configure]
+template = "./templates"
+
+[[candidate]]
+path = "data/site.toml"
+policy = "override"
+
+[[candidate]]
+path = "data/post/*.toml"
+policy = "override"
+```
+
+Shared site settings go in `data/site.toml`.
+
+```toml
+[default.site]
+title = "Example"
+```
+
+Each post contributes a child of `post`. Create `data/post/hello.toml` for the first article.
+
+```toml
+[default.post.hello]
+title = "Hello World"
+date = 2026-10-20
+source = "content/hello.md"
+```
+
+A second file, `data/post/mirage.toml`, adds another child with an optional repository link.
+
+```toml
+[default.post.mirage]
+title = "Building Mirage"
+date = 2026-10-29
+source = "content/mirage.md"
+repository = "https://github.com/wafkse/mirage"
+```
+
+The template at `templates/post/{post}/index.html.jinja` renders those children using their own
+fields. Quote paths containing braces when creating them through a shell.
+
+```jinja
+<h1>{{ title }}</h1>
+<time>{{ date }}</time>
+<p>Source: {{ source }}</p>
+{% if repository is defined %}<a href="{{ repository }}">Repository</a>{% endif %}
+```
+
+Run `mirage --oneshot -C .`. This generates `templates/post/hello/index.html` and
+`templates/post/mirage/index.html`, each rendered with its selected child's context. Ordinary
+templates such as `templates/index.html.jinja` still receive the full context and can reference
+`{{ site.title }}` or iterate over `post`.
+
+To expand a nested table, use a dotted name such as `{catalog.items}`. With multiple parameters,
+each selection becomes the context for the next. Thus `{group}/{items}/index.jinja` selects a group,
+then that group's `items` children. Parameters must occupy entire path components after removal
+of the template extension. Missing or non-table collections produce no instances, and child
+values have no required schema. A template that accesses a missing value follows the configured
+MiniJinja undefined behavior.
+
+Because child keys become
+output path components, they cannot be empty, `.` or `..`, or contain slashes, backslashes, colons,
+or NUL. Before rendering, Mirage rejects duplicate destinations, file/directory conflicts,
+template overwrites, and existing parent symlinks that escape the template root. These checks
+assume the trusted local filesystem is not concurrently rearranged during a pass.
+
+Mirage creates output directories as needed, but does not remove
+outputs when a context key or template disappears. Removing an article therefore requires
+explicitly deleting its stale generated files as well as its inputs. These outputs otherwise
+follow the same update behavior as ordinary templates, described under
+[rendering and updates](#rendering-and-updates).
+
+## Runtime control
+
+After the daemon starts, `miragectl` lets you inspect or change its live context without editing
+the configure files. The client connects to `~/.mirage.sock` by default and prints
+the daemon's JSON response. To address a daemon using another socket, select it with `-C` or
+`--connect`.
+
+```sh
+miragectl -C /tmp/mirage.sock ping
+```
+
+| Command | Effect |
+| --- | --- |
+| `miragectl ping` | Check daemon responsiveness. |
+| `miragectl profile powersave` | Select a profile and rebuild the context. |
+| `miragectl mutate 'system.battery-state = "low"'` | Merge a transient TOML fragment into the current context. |
+| `miragectl context` | Print the current render context inside a JSON response. |
+| `miragectl hydrate` | Render the current context, including transient mutations. |
+
+Mutations merge tables recursively and replace arrays and scalars in the live context, where they
+remain until a configure-file or profile change rebuilds it. Since context rebuilding and rendering
+proceed asynchronously, an acknowledgement confirms acceptance of the update or notification
+without waiting for those operations to finish.
+
+The daemon logs activity at `info` level by default. Set `RUST_LOG=mirage=debug` for more detail
+when diagnosing configuration or rendering problems.
 
 ## Luau extensions
 
@@ -197,11 +278,11 @@ return {
 }
 ```
 
-Mirage loads the module with Luau native code generation enabled and registers its exports, allowing
-templates to use `{{ upper(brand) }}` and `{{ brand | shout }}`. Modules can import other files through
-`require`, which resolves paths relative to the importing file and checks canonical paths against
-the configure root. For directory imports, resolution tries `index.luau` before `init.luau`, and
-successful imports remain cached for the lifetime of the VM.
+Templates can use the exported values as `{{ upper(brand) }}` and `{{ brand | shout }}`. Modules can import other files through
+`require`, which resolves paths relative to the importing file during module evaluation.
+Absolute imports and imports outside the configure root are allowed for trusted local code.
+For directory imports, Mirage tries `index.luau` before `init.luau`. To apply changes to imported
+files, follow the reload instructions below.
 
 Template arguments enter Luau as lazy value handles, where string keys access attributes and
 integer keys use MiniJinja's zero-based sequence indices. The handles expose `:kind()`,
@@ -209,9 +290,13 @@ integer keys use MiniJinja's zero-based sequence indices. The handles expose `:k
 keys that share a method name. To convert a value to native Luau data, call `:materialize()`.
 Both the resulting sequences and generalized iteration over a handle use one-based Luau indices.
 
-Access to Mirage host libraries is controlled by the `[module].libraries` allowlist. The available
-library, `time`, supplies `require("@mirage/time").sleep(seconds)`, which an exported function can
-call directly because the worker drives the asynchronous call to completion during rendering.
+Values returned to a template follow the reverse conversion. Nested Luau tables become MiniJinja
+maps and sequences, with empty tables treated as empty sequences. Cycles are rejected and nesting
+is limited to 128 levels, so exported functions must return acyclic data within that limit.
+
+Access to Mirage host libraries is controlled by the `[module].libraries` allowlist. The `time`
+library supplies `require("@mirage/time").sleep(seconds)`, which pauses an exported function
+for the specified duration.
 Enable it in the manifest with the following setting.
 
 ```toml
@@ -219,56 +304,95 @@ Enable it in the manifest with the following setting.
 libraries = ["time"]
 ```
 
-When a `.luau` file changes, Mirage rebuilds the VM and triggers rendering. If the reload fails,
-the daemon logs the error and renders with the previous VM, while an error during initial module
-loading propagates from startup.
+The `fs` library provides `require("@mirage/fs").read(path)`, which returns a file's bytes as a
+Luau string and raises an error on I/O failure. Relative paths resolve from the configure directory.
+Absolute paths are used directly. Reads follow symlinks and can access any file readable by the
+process, including files outside the configure directory. Enable it with `[module] libraries =
+["fs"]` (or `["fs", "time"]` to enable both libraries). This allowlist makes host API usage explicit.
+It does not make trusted Luau code a filesystem sandbox.
 
-## Runtime control
+Changes to files read through `fs.read` do not automatically trigger rendering. After editing
+such a file, run `miragectl hydrate`, run Mirage again in one-shot mode, or arrange an external
+watcher to request rendering.
 
-Runtime requests go through `miragectl`, which connects to `~/.mirage.sock` by default and prints
-the daemon's JSON response. To address a daemon using another socket, select it with `-C` or
-`--connect`.
+Changes to `.luau` files inside the configure directory reload the extensions and render again.
+If reloading fails, Mirage logs the error and keeps using the previous extensions. An error in
+the initial module prevents startup. Imported modules outside the configure directory require
+touching the configured entry module or restarting Mirage to reload them. `miragectl hydrate`
+alone does not reload imported modules.
 
-```sh
-miragectl -C /tmp/mirage.sock ping
+## Rendering Markdown
+
+The host libraries can work together to turn content files into template data. Enable
+`libraries = ["fs", "markdown"]` under `[module]` to read Markdown with `@mirage/fs` and parse
+it with `@mirage/markdown`. The Markdown module performs no file reads of its own.
+
+Its `parse(string)` function returns a document tree for templates to present.
+Each node carries `type` and `children`, with `literal` holding text on literal nodes. Headings add `level`,
+links and images add `destination` and `title`, code blocks add `language`, and lists add
+`ordered` with an optional `start`. Tables, strikethrough, task markers, and footnotes are enabled.
+Raw HTML remains literal `html` nodes so templates control whether to render or escape it.
+
+For example, configure `module = "lua/engine.luau"` and create that file.
+
+```lua
+local fs = require("@mirage/fs")
+local markdown = require("@mirage/markdown")
+
+return {
+    function_table = {
+        document = function(source)
+            return markdown.parse(fs.read(source:materialize()))
+        end,
+    },
+}
 ```
 
-| Command | Effect |
-| --- | --- |
-| `miragectl ping` | Check daemon responsiveness. |
-| `miragectl profile powersave` | Select a profile and rebuild the context. |
-| `miragectl mutate 'system.battery-state = "low"'` | Merge a transient TOML fragment into the current context. |
-| `miragectl context` | Print the current render context inside a JSON response. |
-| `miragectl hydrate` | Render the current context, including transient mutations. |
+Calling `document(source)` from a template passes the source path as a lazy value handle. The
+function materializes that path for `fs.read`, then returns the parsed tree. Mirage converts
+the nested Luau tables into MiniJinja maps and sequences, making the nodes available to a
+recursive macro. The following macro renders text and headings, escaping text as HTML.
 
-Mutations merge tables recursively and replace arrays and scalars in the live context, where they
-remain until a configure-file or profile change rebuilds it. Since context rebuilding and rendering
-proceed asynchronously, an acknowledgement confirms acceptance of the update or notification
-without waiting for those operations to finish.
-
-Mirage records daemon activity through `tracing` at `info` level by default, using `configure`,
-`hydrate`, and `control` spans. For more detail, set `RUST_LOG=mirage=debug`.
-
-## Testing
-
-```sh
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+```jinja
+{% macro render_node(node) -%}
+  {%- if node.type == "text" -%}
+    {{- node.literal | e -}}
+  {%- elif node.type == "heading" -%}
+    <h{{ node.level }}>{% for child in node.children %}{{ render_node(child) }}{% endfor %}</h{{ node.level }}>
+  {%- else -%}
+    {%- for child in node.children -%}{{ render_node(child) }}{%- endfor -%}
+  {%- endif -%}
+{%- endmacro %}
+{{ render_node(document(source)) }}
 ```
 
-The CLI regression tests exercise initial rendering, filesystem reloads, and exit statuses by
-launching daemon processes with temporary directories and Unix sockets. Unit tests cover the
-underlying merge policies, Luau value conversion, module resolution, template loading, and output
-replacement.
+Other node types need their own presentation branches. As with other filesystem reads, changes
+to Markdown sources require an explicit hydration request or another render trigger.
 
-## Workspace
+## Rendering and updates
 
-| Crate | Responsibility |
-| --- | --- |
-| [`mirage`](mirage) | Manifest loading, profile composition, Luau extensions, rendering, and daemon control. |
-| [`miragectl`](miragectl) | Unix socket client for runtime control requests. |
+Mirage finds templates recursively, including in dot directories, and renders them when it
+starts. Each subsequent update renders all templates again. The output name drops the template
+extension, and the generated file keeps the template's permissions. Built-in MiniJinja functions
+and filters, including `tojson`, are available alongside any Luau exports.
+
+While the daemon runs, edits to matching configure files, templates, and local Luau modules
+trigger updates. The `notificate-period` setting lets a burst of edits settle before rendering.
+Changes to the manifest or environment require restarting the daemon.
+
+If rendering fails, existing output files remain unchanged and the daemon keeps watching for
+further edits. Successful renders replace files individually, so applications watching multiple
+outputs may briefly see values from different updates. A replacement failure can leave some
+files updated and others unchanged, and terminates the daemon. A failure to prepare temporary
+output storage also terminates it.
+
+Applications can reload through their own filesystem watchers or systemd path units. Keep
+persistent changes in templates and configure files because later renders replace generated
+content. In a dotfiles repository, ignore generated paths to avoid tracking those replacements.
+
+Successful one-shot rendering and shutdown through `SIGINT` or `SIGTERM` return exit status `0`.
+One-shot errors and terminal daemon errors return `1`, allowing scripts and service managers
+to detect a failed run.
 
 ## License
 
