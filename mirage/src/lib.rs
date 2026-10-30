@@ -3,8 +3,8 @@
 #![deny(clippy::pedantic)]
 //! Render application configuration from TOML profiles and `MiniJinja` templates.
 //!
-//! [`server`] resolves the manifest and starts the configure, hydration, and control subsystems.
-//! [`state`] owns their event loops and shared context. [`lua`] supplies Luau template extensions.
+//! Use [`server::Mirage`] to run a daemon or render templates once. Extend templates with
+//! functions, filters, and globals through [`lua`].
 
 pub mod filesystem;
 

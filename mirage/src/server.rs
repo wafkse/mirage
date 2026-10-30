@@ -1,7 +1,6 @@
-//! Manifest resolution and daemon lifecycle.
+//! Configure and run Mirage as a daemon or render templates once.
 //!
-//! [`Mirage::new`] constructs the configure, hydration, and control subsystems from [`MirageCli`]
-//! and the manifest. [`Mirage::oneshot`] uses the same settings for a synchronous render.
+//! Use [`Mirage::new`] for continuous updates or [`Mirage::oneshot`] for a synchronous render.
 
 use std::{env::home_dir, path::PathBuf, time::Duration};
 
@@ -36,7 +35,7 @@ use crate::{
     },
 };
 
-/// The Mirage command-line daemon.
+/// Command-line settings for daemon execution or one-shot rendering.
 #[derive(Debug, Clone, Parser)]
 pub struct MirageCli {
     /// The path to the directory of configure candidates.
@@ -67,7 +66,7 @@ pub struct MirageCli {
 // NOTE(invariant): None.
 #[derive(Debug)]
 struct Resolved {
-    /// The expanded configure root, doubling as the candidate root and the `require` jail.
+    /// The expanded base directory for configure candidates and relative entry-module imports.
     configure_root: PathBuf,
 
     /// The manifest candidate list folded into the render context.
@@ -98,8 +97,8 @@ struct Resolved {
 impl Resolved {
     /// Resolve the command line, manifest, and defaults into [`Resolved`] settings.
     ///
-    /// Expand the configure root before loading `.mirage.toml`, then expand the selected template,
-    /// socket, and module paths. Manifest environment overrides use the `MIRAGE_MANIFEST_` prefix.
+    /// Command-line values override the manifest. Environment overrides for the manifest use
+    /// the `MIRAGE_MANIFEST_` prefix.
     ///
     /// # Errors
     ///
@@ -193,11 +192,10 @@ impl Resolved {
     }
 }
 
-/// The configure, hydration, and control subsystems of a daemon instance.
+/// A daemon that keeps generated configuration up to date as its inputs change.
 ///
-/// Configure changes publish a TOML context to the hydration worker. That worker renders each
-/// template beside its source with the template extension removed. The control socket accepts
-/// requests to select profiles, mutate context values, inspect the context, and request rendering.
+/// The control socket accepts requests to select profiles, mutate context values, inspect the
+/// context, and request rendering.
 // NOTE(invariant): None.
 #[derive(Debug)]
 pub struct Mirage {
@@ -219,8 +217,6 @@ impl Mirage {
     pub const MIRAGE_SOCK_DOTFILE: &str = ".mirage.sock";
 
     /// Construct a new daemon state from the target settings.
-    ///
-    /// Load the initial context and Luau module, register filesystem watchers, and bind the control socket.
     ///
     /// # Panics
     ///
@@ -275,9 +271,6 @@ impl Mirage {
 
     /// Resolve the manifest and render the templates once.
     ///
-    /// Load the context and optional Luau module, stage the rendered files, then replace each output.
-    /// Rendering owns a current-thread Tokio runtime to drive asynchronous Luau functions.
-    ///
     /// # Panics
     ///
     /// Panics when rendering calls a Luau function from within an active Tokio runtime.
@@ -317,6 +310,7 @@ impl Mirage {
 impl Background for Mirage {
     type Output = ();
 
+    #[inline]
     async fn run(self) -> eyre::Result<Self::Output> {
         let Self {
             configure,

@@ -1,7 +1,6 @@
-//! Path expansion and asynchronous delivery of filesystem events.
+//! Path expansion and filesystem change notifications.
 //!
-//! [`ExpandedPath`] resolves shell expressions in daemon path inputs.
-//! [`FsWatcher`] retains a platform watcher and receives its successful events through a channel.
+//! See [`ExpandedPath`] and [`FsWatcher`] for additional information.
 
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -16,7 +15,7 @@ use tokio::sync::mpsc;
 
 /// A daemon path after shell-style expansion of its input expression.
 ///
-/// Construction expands a leading `~` and environment references through `shellexpand`.
+/// Supports a leading `~` and environment references written as `$VAR` or `${VAR}`.
 // NOTE(invariant): None.
 #[derive(Debug, Clone)]
 pub struct ExpandedPath(PathBuf);
@@ -58,9 +57,7 @@ impl ExpandedPath {
 pub struct FsWatcher(mpsc::UnboundedReceiver<Event>, RecommendedWatcher);
 
 impl FsWatcher {
-    /// Instantiate the standard configuration for this filesystem watcher.
-    ///
-    /// Uses [`notify::Config::default`].
+    /// Create a watcher using [`notify::Config::default`].
     ///
     /// # Errors
     ///
@@ -79,15 +76,15 @@ impl FsWatcher {
     pub fn configured(target_configure: notify::Config) -> eyre::Result<Self> {
         let (channel_send, channel_recv) = mpsc::unbounded_channel();
 
-        Ok(Self(
-            channel_recv,
-            RecommendedWatcher::new(FsEventForwarder(channel_send), target_configure)?,
-        ))
+        let target_handler = FsEventForwarder(channel_send);
+        let target_watcher = RecommendedWatcher::new(target_handler, target_configure)?;
+
+        Ok(Self(channel_recv, target_watcher))
     }
 }
 
 impl FsWatcher {
-    /// Borrow the `mpsc` receiver attached for this filesystem watcher.
+    /// Receive filesystem change notifications.
     #[inline]
     #[must_use]
     pub const fn receiver(&self) -> &mpsc::UnboundedReceiver<Event> {
@@ -96,7 +93,7 @@ impl FsWatcher {
         target_recv
     }
 
-    /// Mutably borrow the `mpsc` receiver attached for this filesystem watcher.
+    /// Receive filesystem change notifications through a mutable receiver.
     #[inline]
     pub const fn receiver_mut(&mut self) -> &mut mpsc::UnboundedReceiver<Event> {
         let Self(target_recv, ..) = self;
@@ -127,7 +124,7 @@ impl DerefMut for FsWatcher {
 
 /// Forward successful watcher events to the receiving [`FsWatcher`].
 ///
-/// Sending an event panics if the receiver has been dropped. Watcher errors are discarded.
+/// Events arriving after receiver shutdown and watcher errors are discarded.
 // NOTE(invariant): None.
 #[derive(Debug)]
 struct FsEventForwarder(mpsc::UnboundedSender<Event>);
@@ -138,9 +135,7 @@ impl EventHandler for FsEventForwarder {
         if let Ok(target_event) = target_event {
             let Self(channel_send) = self;
 
-            channel_send
-                .send(target_event)
-                .expect("failed to send filesystem event");
+            let _ = channel_send.send(target_event);
         }
     }
 }

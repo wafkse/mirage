@@ -1,7 +1,6 @@
 //! Send runtime control requests to a Mirage daemon.
 //!
-//! The client sends a length-prefixed JSON request over a Unix socket and writes the JSON
-//! response to standard output. [`ControlCommand`] selects the request.
+//! See [`ControlCommand`] for the available commands.
 
 use std::{
     env::home_dir,
@@ -29,13 +28,13 @@ pub const RECEIVE_SOCKET_NAME: &str = "miragectl.sock";
 /// A daemon control command.
 #[derive(Debug, Parser, Clone)]
 pub enum ControlCommand {
-    /// Send a ping message to the daemon to determine responsiveness.
+    /// Check daemon responsiveness.
     Ping,
 
-    /// Trigger a re-hydrate on the daemon.
+    /// Render all templates with the current context.
     Hydrate,
 
-    /// Send a profile-change message to the daemon.
+    /// Select the active profile.
     Profile {
         /// The name of the profile to use.
         name: String,

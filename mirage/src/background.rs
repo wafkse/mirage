@@ -1,6 +1,6 @@
 //! Asynchronous execution contract shared by the daemon subsystems.
 //!
-//! [`Background::run`] consumes a subsystem and drives its event loop to termination.
+//! See the [`Background`] trait for additional information.
 
 /// A subsystem that owns its state for the duration of an asynchronous task.
 pub trait Background {

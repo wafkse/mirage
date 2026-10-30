@@ -1,7 +1,6 @@
-//! Runtime control requests over a Unix domain socket.
+//! Runtime control of a Mirage daemon.
 //!
-//! Connections exchange length-prefixed JSON messages. [`ControlState`] serializes request
-//! handling against the configure channels while connection tasks perform socket I/O.
+//! See [`ControlRequest`] and [`ControlResponse`] for the available operations and responses.
 
 use futures::{SinkExt, StreamExt};
 use tokio::{
@@ -20,34 +19,27 @@ use crate::{background::Background, state::configure::ConfigurePipe};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "lowercase")]
 pub enum ControlRequest {
-    /// A ping message.
+    /// Check daemon responsiveness.
     Ping,
 
-    /// A profile change message.
+    /// Select the active profile.
     Profile {
         /// The name of the profile to change to.
         name: figment::Profile,
     },
 
-    /// A hydrate message.
-    ///
-    /// This forces a full re-hydrate operation.
+    /// Render all templates with the current context.
     Hydrate,
 
-    /// A mutate message.
+    /// Merge a transient TOML fragment into the current context and request rendering.
     ///
-    /// Deep-merge a TOML fragment into the current render context and notify the hydration worker.
-    ///
-    /// Mutations remain until the configure subsystem rebuilds the context from files, environment
-    /// values, and the selected profile. A [`Self::Hydrate`] request retains the mutated context.
+    /// File or profile changes discard mutations. A [`Self::Hydrate`] request retains them.
     Mutate {
         /// The raw TOML fragment to deep-merge into the source context (e.g. `system.battery-state = "low"`).
         expression: String,
     },
 
-    /// A context message.
-    ///
-    /// This permits dumping the context of the daemon to a requesting client.
+    /// Request the daemon's current render context.
     Context,
 }
 
@@ -55,17 +47,13 @@ pub enum ControlRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "lowercase")]
 pub enum ControlResponse {
-    /// A pong message.
+    /// The daemon responded to a ping.
     Pong,
 
-    /// An acknowledgement message.
-    ///
-    /// The context update or profile notification was accepted. Rendering proceeds asynchronously.
+    /// The update was accepted, without waiting for rendering to finish.
     Acknowledge,
 
-    /// A context message.
-    ///
-    /// Contains the current render context encoded as JSON.
+    /// The current render context encoded as JSON.
     Context {
         /// The associated context.
         context: serde_json::Value,
@@ -78,10 +66,9 @@ pub enum ControlResponse {
     },
 }
 
-/// A control listener and the channels used to update daemon state.
+/// A daemon control endpoint.
 ///
-/// Incoming connections forward requests to a serial dispatch loop. Dropping the state removes
-/// the listener's socket path when it can be determined.
+/// Dropping the state removes the listener's socket path when it can be determined.
 // NOTE(invariant): None.
 #[derive(Debug)]
 pub struct ControlState(UnixListener, ConfigurePipe);
@@ -168,6 +155,7 @@ impl ControlState {
 impl Background for ControlState {
     type Output = ();
 
+    #[inline]
     async fn run(mut self) -> eyre::Result<Self::Output> {
         /// Work serialized by the control dispatch loop.
         enum Operation {
@@ -254,6 +242,7 @@ impl Background for ControlState {
 }
 
 impl Drop for ControlState {
+    #[inline]
     fn drop(&mut self) {
         let Self(target_endpoint, ..) = self;
 

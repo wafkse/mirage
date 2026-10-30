@@ -1,19 +1,22 @@
-//! Luau module loading and value conversion for `MiniJinja` templates.
+//! Luau extensions for `MiniJinja` templates.
 //!
-//! [`LuaRuntime`] evaluates the configured module and registers its exported functions, filters,
-//! and globals alongside `MiniJinja`'s built-ins. File modules resolve within the configure root.
-//! Host modules under `@mirage/` require permission in [`ManifestModule::libraries`].
-//!
-//! Template arguments enter Luau as [`MirageValue`] userdata with lazy lookups. Returning that
-//! userdata preserves the underlying `MiniJinja` value. Native Luau return values are converted
-//! through [`MirageValue::try_from`], which checks table depth, cycles, and map keys.
+//! See [`LuaRuntime`] for loading extensions and [`MirageValue`] for template arguments in Luau.
+
+pub mod markdown;
+
+pub mod library;
+
+pub mod fs;
+
+pub mod time;
+
+use library::Library;
 
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use eyre::eyre;
@@ -52,10 +55,7 @@ impl MirageValue {
         target_value
     }
 
-    /// Construct the function backing a reserved [`MirageValue`] method name.
-    ///
-    /// Each closure captures the wrapped value. The `get` closure accepts the implicit receiver
-    /// followed by the lookup key.
+    /// Resolve a reserved [`MirageValue`] method name.
     fn method(&self, target_lua: &Lua, method_name: &str) -> mlua::Result<mlua::Value> {
         let Self(target_value) = self;
 
@@ -250,6 +250,7 @@ impl MirageValue {
 }
 
 impl UserData for MirageValue {
+    #[inline]
     fn add_methods<M: UserDataMethods<Self>>(target_methods: &mut M) {
         target_methods.add_meta_method(
             MetaMethod::Index,
@@ -386,7 +387,7 @@ impl ValueConversion {
         Self::error(target_error.to_string())
     }
 
-    /// The recursive worker behind [`MirageValue::try_from`], threading the depth budget and cycle-detection set.
+    /// Convert a value within the remaining table-depth limit.
     fn value(
         &mut self,
         target_value: mlua::Value,
@@ -562,8 +563,6 @@ impl LuaCallable {
     /// A filter's piped value leads the argument list. Defined arguments use lazy [`MirageValue`]
     /// wrappers and undefined arguments become `nil`. The return value crosses back through
     /// [`MirageValue::try_from`].
-    ///
-    /// The worker runtime drives `call_async` to completion during synchronous rendering.
     fn invoke(
         &self,
         piped_value: Option<minijinja::Value>,
@@ -616,10 +615,10 @@ struct RequireState {
 }
 
 /// Per-VM file resolution, host-library permissions, and import caches.
-// NOTE(invariant): `root` is canonical and file cache keys lie within it.
+// NOTE(invariant): `root` and file cache keys are canonical paths.
 #[derive(Debug)]
 struct ModuleLoader {
-    /// The canonical configure root bounding file imports.
+    /// The canonical configure root used for entry imports and filesystem reads.
     root: PathBuf,
 
     /// Host-library names permitted by the manifest.
@@ -650,7 +649,7 @@ impl ModuleLoader {
     /// The host `require` implementation, shared by the top-level module load and in-module requires.
     ///
     /// File imports resolve against the requiring file's directory, or the configure root for the
-    /// entry module. Canonical paths must remain within that root. `@mirage/` imports use the host
+    /// entry module. Trusted code may import outside that root. `@mirage/` imports use the host
     /// library allowlist and cache.
     fn require(&self, target_lua: &Lua, target_spec: &str) -> mlua::Result<mlua::Value> {
         let Self {
@@ -673,12 +672,6 @@ impl ModuleLoader {
 
         let resolved_path = Self::resolve(&require_base, target_spec)
             .map_err(|target_error| mlua::Error::runtime(target_error.to_string()))?;
-
-        if !resolved_path.starts_with(root) {
-            return Err(mlua::Error::runtime(format!(
-                "module `{target_spec}` escapes the configure root"
-            )));
-        }
 
         let cached = {
             let state = state.lock().expect("require state poisoned");
@@ -738,7 +731,10 @@ impl ModuleLoader {
     /// Check the allowlist before looking up the library. Successful instances are cached for the VM's lifetime.
     fn host(&self, target_lua: &Lua, target_library: &str) -> mlua::Result<mlua::Value> {
         let Self {
-            libraries, state, ..
+            libraries,
+            state,
+            root,
+            ..
         } = self;
 
         if !libraries.iter().any(|allowed| allowed == target_library) {
@@ -760,7 +756,7 @@ impl ModuleLoader {
         }
 
         let Some(target_module) =
-            HostLibrary::resolve(target_library).map(|library| library.build(target_lua))
+            HostLibrary::resolve(target_library).map(|library| library.build(target_lua, root))
         else {
             return Err(mlua::Error::runtime(format!(
                 "unknown Mirage module `@mirage/{target_library}`"
@@ -830,6 +826,10 @@ impl ModuleLoader {
 enum HostLibrary {
     /// Asynchronous timing operations.
     Time,
+    /// Local filesystem reads for trusted modules.
+    Fs,
+    /// `CommonMark` parsing into semantic tables.
+    Markdown,
 }
 
 impl HostLibrary {
@@ -837,35 +837,23 @@ impl HostLibrary {
     fn resolve(target_library: &str) -> Option<Self> {
         match target_library {
             "time" => Some(Self::Time),
+            "fs" => Some(Self::Fs),
+            "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
 
     /// Build the selected library's Luau export table.
-    fn build(self, target_lua: &Lua) -> mlua::Result<mlua::Table> {
+    fn build(self, target_lua: &Lua, configure_root: &Path) -> mlua::Result<mlua::Table> {
         match self {
-            Self::Time => {
-                let target_table = target_lua.create_table()?;
-
-                let target_sleep =
-                    target_lua.create_async_function(|_, target_seconds: f64| async move {
-                        tokio::time::sleep(Duration::from_secs_f64(target_seconds.max(0.0))).await;
-
-                        Ok(())
-                    })?;
-
-                target_table.set("sleep", target_sleep)?;
-
-                Ok(target_table)
-            }
+            Self::Markdown => markdown::Markdown.build(target_lua),
+            Self::Fs => fs::Filesystem::new(configure_root).build(target_lua),
+            Self::Time => time::Time.build(target_lua),
         }
     }
 }
 
-/// The Luau scripting runtime owning the module VM and its extracted registrations.
-///
-/// Retains the evaluated module's VM, functions, filters, and global values. Each render registers
-/// these exports in a fresh `MiniJinja` environment. Reloading constructs a new runtime.
+/// A loaded Luau extension supplying template functions, filters, and globals.
 // NOTE(invariant): None.
 #[derive(Debug)]
 pub struct LuaRuntime {
@@ -883,10 +871,9 @@ pub struct LuaRuntime {
 }
 
 impl LuaRuntime {
-    /// Build a Luau VM, evaluate the manifest-declared module, and extract its registrations.
+    /// Load a Luau extension module relative to the configure root.
     ///
-    /// Resolve the module path relative to the configure root and enable Luau native code generation.
-    /// The [`ManifestModule`] allowlist controls access to `@mirage/` host libraries.
+    /// Access to `@mirage/` host libraries requires permission in [`ManifestModule::libraries`].
     ///
     /// # Errors
     ///
@@ -932,8 +919,7 @@ impl LuaRuntime {
 
     /// Register every exported function, filter, and global into the provided [`Environment`].
     ///
-    /// Registered callables capture the shared runtime to drive asynchronous Luau functions during
-    /// rendering. Registering an export replaces an existing item with the same name.
+    /// An export replaces an existing item with the same name.
     ///
     /// # Panics
     ///
@@ -992,7 +978,7 @@ impl LuaRuntime {
 
     /// Extract the `function_table`, `filter_table`, and `environment_table` tables from an evaluated module value.
     ///
-    /// A non-table module value yields empty exports, and a missing export tables yield empty registrations
+    /// A non-table module value yields empty exports, and missing export tables yield empty registrations
     /// for that category.
     ///
     /// Unknown top-level keys are ignored.
@@ -1476,7 +1462,75 @@ mod tests {
     }
 
     #[test]
-    fn file_imports_reject_paths_outside_the_configure_root() {
+    fn filesystem_reads_outside_configure_and_returns_ast_to_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("configure");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(dir.path().join("content.md"), "Hello World").unwrap();
+        std::fs::write(
+            dir.path().join("parser.luau"),
+            r#"
+            return { parse = function(text)
+                return { type = "document", children = {
+                    { type = "heading", level = 1, children = {
+                        { type = "text", literal = text }
+                    } }
+                } }
+            end }
+        "#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("engine.luau"),
+            r#"
+            local fs = require("@mirage/fs")
+            local parser = require("../parser")
+            return { function_table = { document = function(source)
+                return parser.parse(fs.read(source:materialize()))
+            end } }
+        "#,
+        )
+        .unwrap();
+        let module = LuaRuntime::load(
+            &root,
+            Path::new("engine.luau"),
+            &ManifestModule {
+                libraries: vec!["fs".into()],
+            },
+        )
+        .unwrap();
+        let mut env = Environment::new();
+        module.register(&mut env, &LuaRuntime::runtime());
+        env.add_template("ast", r"{% macro node(n) %}{% if n.type == 'text' %}{{ n.literal }}{% elif n.type == 'heading' %}<h{{ n.level }}>{% for child in n.children %}{{ node(child) }}{% endfor %}</h{{ n.level }}>{% else %}{% for child in n.children %}{{ node(child) }}{% endfor %}{% endif %}{% endmacro %}{{ node(document(source)) }}").unwrap();
+        for source in [
+            "../content.md".to_string(),
+            dir.path().join("content.md").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                env.get_template("ast")
+                    .unwrap()
+                    .render(minijinja::context! { source })
+                    .unwrap(),
+                "<h1>Hello World</h1>"
+            );
+        }
+        std::fs::remove_file(dir.path().join("content.md")).unwrap();
+        assert!(
+            env.get_template("ast")
+                .unwrap()
+                .render(minijinja::context! { source => "../content.md" })
+                .is_err()
+        );
+        assert!(
+            LuaRuntime::load(&root, Path::new("engine.luau"), &ManifestModule::default())
+                .unwrap_err()
+                .to_string()
+                .contains("not permitted")
+        );
+    }
+
+    #[test]
+    fn file_imports_allow_paths_outside_the_configure_root() {
         let target_dir = tempfile::tempdir().unwrap();
 
         let configure_root = target_dir.path().join("configure");
@@ -1495,11 +1549,6 @@ mod tests {
             &ManifestModule::default(),
         );
 
-        assert!(
-            target_result
-                .unwrap_err()
-                .to_string()
-                .contains("escapes the configure root")
-        );
+        assert!(target_result.is_ok());
     }
 }

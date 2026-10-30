@@ -1,9 +1,9 @@
-//! Template rendering, staged output replacement, and Luau module reloads.
+//! Template rendering and Luau extension reloads.
 //!
-//! [`HydrationState`] watches template, module, and context changes on a dedicated worker thread.
-//! Each pass stages every rendered output before replacing destination files individually.
+//! See [`HydrationState`] for additional information.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -28,12 +28,10 @@ use crate::{
     manifest::{ManifestModule, UndefinedKind},
 };
 
-/// Paths and library permissions used to load a hydration worker's Luau module.
-///
-/// The worker retains these inputs to build a fresh VM when Luau files change.
+/// Paths and library permissions for a Luau extension module.
 #[derive(Debug, Clone)]
 pub struct ModuleSource {
-    /// The configure root, used as the `require` jail.
+    /// The configure root, used as the base for entry imports and filesystem reads.
     pub configure_root: PathBuf,
 
     /// The module path, resolved relative to the configure root.
@@ -45,8 +43,7 @@ pub struct ModuleSource {
 
 /// Render templates in response to changes in templates, Luau modules, and the TOML context.
 ///
-/// The worker coalesces input events, stages rendered files, and replaces each destination by
-/// rename. A failed module reload retains the previous VM for subsequent rendering.
+/// A failed module reload leaves the previous extensions available for subsequent rendering.
 // NOTE(invariant): None.
 #[derive(Debug)]
 pub struct HydrationState {
@@ -92,10 +89,7 @@ enum HydrationEvent {
 }
 
 impl HydrationState {
-    /// Instantiate a new hydration state.
-    ///
-    /// When `module_source` is present, evaluate the module during construction. Register watchers
-    /// for the template tree and, when applicable, the configure tree containing Luau modules.
+    /// Watch the configured inputs for template rendering.
     ///
     /// # Errors
     ///
@@ -144,11 +138,7 @@ impl HydrationState {
         })
     }
 
-    /// Drive the synchronous hydration loop on the worker thread.
-    ///
-    /// Render the initial context before waiting for events. A current-thread runtime drives
-    /// asynchronous Luau calls and subsequent event waits. Each `block_on` call finishes before
-    /// the next begins.
+    /// Render the initial context and process subsequent input changes.
     fn drive(self) -> eyre::Result<()> {
         let Self {
             mut lua_runtime,
@@ -303,6 +293,7 @@ impl ModuleSource {
 impl Background for HydrationState {
     type Output = ();
 
+    #[inline]
     async fn run(self) -> eyre::Result<Self::Output> {
         // NOTE: The worker owns the current-thread runtime used by rendering and asynchronous Luau calls.
         let (result_send, result_recv) = oneshot::channel();
@@ -340,10 +331,7 @@ impl HydrationState {
         )
     }
 
-    /// Render every template once and commit the result, building a private runtime to drive any async module code.
-    ///
-    /// The current-thread runtime drives asynchronous Luau functions during rendering. Output files
-    /// are replaced individually after every template has rendered successfully.
+    /// Render every template once and replace the generated outputs.
     ///
     /// # Errors
     ///
@@ -372,9 +360,7 @@ impl HydrationState {
         renderer.render(target_context, temp_filedir)?.commit()
     }
 
-    /// Log a render or module reload error chain through tracing.
-    ///
-    /// The worker continues waiting for input changes after these failures.
+    /// Log a recoverable rendering or module-reload error.
     fn report(target_report: &eyre::Report) {
         let target_chain = target_report
             .chain()
@@ -553,7 +539,132 @@ impl TemplateTree {
             target_list.push(target_name);
         }
 
+        target_list.sort();
+
         Ok(target_list)
+    }
+}
+
+/// A discovered template bound to a context and an output path relative to the root.
+#[derive(Debug)]
+// NOTE(invariant): None.
+struct TemplateInstance<'context> {
+    /// Template name relative to the discovered template root.
+    name: String,
+
+    /// Expanded output path relative to the template root.
+    destination: PathBuf,
+
+    /// Borrowed context selected by the template path parameters.
+    context: &'context toml::Value,
+}
+
+impl TemplateTree {
+    /// Expand whole-component `{path}` parameters, looking up dotted paths in the current context.
+    /// Later parameters descend from the previously selected child. Missing/non-table paths
+    /// produce no instances. No schema is imposed on the selected child values.
+    fn instances<'context>(
+        &self,
+        context: &'context toml::Value,
+    ) -> eyre::Result<Vec<TemplateInstance<'context>>> {
+        let mut instances = Vec::new();
+        let mut destinations = BTreeSet::new();
+        let names = self.names()?;
+
+        for name in &names {
+            let mut paths = vec![(PathBuf::new(), context)];
+            let output = Path::new(name).with_extension("");
+            for component in output.components() {
+                let component = component.as_os_str().to_string_lossy();
+                let parameter = component
+                    .strip_prefix('{')
+                    .and_then(|s| s.strip_suffix('}'));
+                let mut expanded = Vec::new();
+                for (path, context) in paths {
+                    if let Some(parameter) = parameter {
+                        let selected = parameter
+                            .split('.')
+                            .try_fold(context, |value, key| value.get(key));
+                        if let Some(table) = selected.and_then(toml::Value::as_table) {
+                            let mut children: Vec<_> = table.iter().collect();
+                            children.sort_by(|a, b| a.0.cmp(b.0));
+                            for (key, value) in children {
+                                if !Self::safe_component(key) {
+                                    return Err(eyre!("invalid path binding `{key}` in `{name}`"));
+                                }
+                                expanded.push((path.join(key), value));
+                            }
+                        }
+                    } else {
+                        expanded.push((path.join(component.as_ref()), context));
+                    }
+                }
+                paths = expanded;
+            }
+            for (destination, context) in paths {
+                if !destinations.insert(destination.clone()) {
+                    return Err(eyre!(
+                        "duplicate output destination `{}`",
+                        destination.display()
+                    ));
+                }
+                instances.push(TemplateInstance {
+                    name: name.clone(),
+                    destination,
+                    context,
+                });
+            }
+        }
+
+        let root = self.root().canonicalize()?;
+        let mut resolved_destinations = BTreeSet::new();
+        for destination in &destinations {
+            // NOTE: Resolve existing parent directories, including internal symlink aliases.
+            // Rename replaces a destination symlink itself, so the final component is not canonicalized.
+            let output = root.join(destination);
+            let ancestor = output
+                .ancestors()
+                .skip(1)
+                .find(|p| p.exists())
+                .ok_or_else(|| eyre!("output has no existing parent"))?;
+            let resolved_parent = ancestor.canonicalize()?;
+            if !resolved_parent.starts_with(&root) {
+                return Err(eyre!(
+                    "output escapes template root: `{}`",
+                    destination.display()
+                ));
+            }
+            let resolved = resolved_parent.join(output.strip_prefix(ancestor)?);
+            if !resolved_destinations.insert(resolved) {
+                return Err(eyre!(
+                    "duplicate output destination `{}`",
+                    destination.display()
+                ));
+            }
+        }
+        for destination in &resolved_destinations {
+            // NOTE: Reject file/directory conflicts and outputs that would overwrite template inputs.
+            if destination
+                .ancestors()
+                .skip(1)
+                .any(|p| resolved_destinations.contains(p))
+                || names.iter().any(|name| root.join(name) == *destination)
+            {
+                return Err(eyre!(
+                    "conflicting output destination `{}`",
+                    destination.display()
+                ));
+            }
+        }
+        Ok(instances)
+    }
+
+    /// Accept a nonempty filename component without traversal or platform separators.
+    fn safe_component(value: &str) -> bool {
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && !value.contains(['/', '\\', ':', '\0'])
     }
 }
 
@@ -590,10 +701,7 @@ impl<'render> Renderer<'render> {
         }
     }
 
-    /// Construct a fresh [`Environment`] over the current template tree and module registrations.
-    ///
-    /// Each pass loads current template contents and registers exports from the retained Luau VM.
-    /// Registered callables capture the worker runtime to drive asynchronous module functions.
+    /// Create a template environment with the current Luau exports.
     fn environment(&self) -> Environment<'static> {
         let Self {
             target_runtime,
@@ -633,37 +741,31 @@ impl<'render> Renderer<'render> {
 
         let target_environment = self.environment();
 
-        let target_context = MirageValue::from(target_context).value();
-
+        let instances = template_tree.instances(target_context)?;
         let mut rename_list = Vec::new();
 
-        for template_name in template_tree.names()? {
-            let mut template_path = template_tree.root().join(template_name.as_str());
-
-            let template_perms = fs::metadata(template_path.as_path())?.permissions();
-
-            let mut temp_path = temp_filedir.path().join(template_name.as_str());
-
-            let _ = template_path.set_extension("");
-            let _ = temp_path.set_extension("");
-
+        for TemplateInstance {
+            name,
+            destination,
+            context,
+        } in instances
+        {
+            let template_path = template_tree.root().join(&name);
+            let template_perms = fs::metadata(&template_path)?.permissions();
+            let temp_path = temp_filedir.path().join(&destination);
             fs::create_dir_all(
                 temp_path
                     .parent()
-                    .ok_or_else(|| eyre!("tempfile does not have a parent"))?,
+                    .ok_or_else(|| eyre!("tempfile has no parent"))?,
             )?;
 
             let rendered_output = target_environment
-                .get_template(template_name.as_str())?
-                .render(&target_context)?;
-
-            fs::write(temp_path.as_path(), rendered_output)?;
-
-            fs::set_permissions(temp_path.as_path(), template_perms)?;
-
-            tracing::trace!(template = %template_name, "staged template");
-
-            rename_list.push((temp_path, template_path));
+                .get_template(&name)?
+                .render(MirageValue::from(context).value())?;
+            fs::write(&temp_path, rendered_output)?;
+            fs::set_permissions(&temp_path, template_perms)?;
+            tracing::trace!(template = %name, "staged template");
+            rename_list.push((temp_path, template_tree.root().join(destination)));
         }
 
         tracing::info!(rendered = rename_list.len(), "render pass staged");
@@ -698,6 +800,7 @@ impl StagedRender {
         } = self;
 
         for (from, to) in rename_list {
+            fs::create_dir_all(to.parent().ok_or_else(|| eyre!("output has no parent"))?)?;
             fs::rename(&from, &to)
                 .wrap_err_with(|| format!("could not replace output `{}`", to.display()))?;
         }
@@ -820,6 +923,190 @@ mod tests {
         staged.commit().unwrap();
 
         assert_eq!(std::fs::read_to_string(output_path).unwrap(), "mirage");
+    }
+
+    fn render(root: &Path, context: &str) -> eyre::Result<()> {
+        super::HydrationState::oneshot(
+            None,
+            root,
+            "jinja",
+            UndefinedKind::Strict,
+            &toml::from_str(context)?,
+        )
+    }
+
+    #[test]
+    fn parameters_bind_subcontexts_and_preserve_ordinary_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("post/{post}")).unwrap();
+        std::fs::write(root.join("index.jinja"), "{{ site }}:{{ post|length }}").unwrap();
+        std::fs::write(
+            root.join("post/{post}/index.html.jinja"),
+            "{{ title }}:{{ repository|default('none') }}",
+        )
+        .unwrap();
+        render(root, "site = 'Example'\n[post.hello]\ntitle = 'Hello'\n[post.mirage]\ntitle = 'Mirage'\nrepository = 'url'").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("index")).unwrap(),
+            "Example:2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("post/hello/index.html")).unwrap(),
+            "Hello:none"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("post/mirage/index.html")).unwrap(),
+            "Mirage:url"
+        );
+
+        // Deleted keys leave prior outputs in place; new instances still render.
+        render(root, "site = 'New'\n[post.hello]\ntitle = 'Updated'").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("post/mirage/index.html")).unwrap(),
+            "Mirage:url"
+        );
+    }
+
+    #[test]
+    fn invalid_bindings_and_collisions_leave_outputs_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("{post}")).unwrap();
+        std::fs::write(root.join("{post}/index.jinja"), "{{ title }}").unwrap();
+        for key in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "C:drive",
+        ] {
+            let mut children = toml::Table::new();
+            children.insert(key.into(), toml::Value::Table(toml::Table::new()));
+            let context = toml::Value::Table(toml::Table::from_iter([(
+                "post".into(),
+                toml::Value::Table(children),
+            )]));
+            assert!(
+                TemplateTree::new(root, "jinja")
+                    .instances(&context)
+                    .is_err(),
+                "{key:?}"
+            );
+        }
+        std::fs::create_dir_all(root.join("hello")).unwrap();
+        std::fs::write(root.join("hello/index.jinja"), "ordinary").unwrap();
+        std::fs::write(root.join("hello/index"), "previous").unwrap();
+        assert!(
+            render(root, "[post.hello]\ntitle = 'new'")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("hello/index")).unwrap(),
+            "previous"
+        );
+    }
+
+    #[test]
+    fn output_file_directory_conflicts_and_template_overwrites_are_rejected() {
+        for template in ["hello.jinja", "hello/index.jinja"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::write(root.join("{post}.jinja"), "generated").unwrap();
+            std::fs::create_dir_all(root.join(template).parent().unwrap()).unwrap();
+            std::fs::write(root.join(template), "original").unwrap();
+            // First case would overwrite hello.jinja; second would make hello both a file and directory.
+            let context = if template == "hello.jinja" {
+                "[post.'hello.jinja']"
+            } else {
+                "[post.hello]"
+            };
+            assert!(
+                render(root, context)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("conflicting")
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join(template)).unwrap(),
+                "original"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_destinations_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("{post}")).unwrap();
+        std::fs::create_dir(root.join("actual")).unwrap();
+        std::os::unix::fs::symlink(root.join("actual"), root.join("alias")).unwrap();
+        std::fs::write(root.join("{post}/index.jinja"), "new").unwrap();
+        assert!(
+            render(root, "[post.actual]\n[post.alias]")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        assert!(!root.join("actual/index").exists());
+    }
+
+    #[test]
+    fn parameter_render_failure_preserves_all_previous_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("{post}")).unwrap();
+        std::fs::write(root.join("{post}/index.jinja"), "{{ title }}").unwrap();
+        render(root, "[post.a]\ntitle = 'old a'\n[post.b]\ntitle = 'old b'").unwrap();
+        assert!(render(root, "[post.a]\ntitle = 'new a'\n[post.b]\nother = true").is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a/index")).unwrap(),
+            "old a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b/index")).unwrap(),
+            "old b"
+        );
+    }
+
+    #[test]
+    fn nested_parameters_and_missing_collections_expand_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("{group}/{items}")).unwrap();
+        std::fs::write(dir.path().join("{group}/{items}/out.jinja"), "{{ value }}").unwrap();
+        let tree = TemplateTree::new(dir.path(), "jinja");
+        let context =
+            toml::from_str("[group.z.items.b]\nvalue = 2\n[group.a.items.a]\nvalue = 1").unwrap();
+        let paths: Vec<_> = tree
+            .instances(&context)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.destination)
+            .collect();
+        assert_eq!(paths, [Path::new("a/a/out"), Path::new("z/b/out")]);
+        assert!(
+            tree.instances(&toml::Value::Table(toml::Table::new()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_outputs_cannot_escape_through_symlink_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("{post}")).unwrap();
+        std::fs::write(dir.path().join("{post}/index.jinja"), "new").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        assert!(render(dir.path(), "[post.escape]").is_err());
+        assert!(!outside.path().join("index").exists());
     }
 
     #[test]

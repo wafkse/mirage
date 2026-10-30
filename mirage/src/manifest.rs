@@ -1,8 +1,6 @@
-//! Manifest settings, candidate discovery, and merge policies.
+//! Configuration settings and input files for a Mirage-managed directory.
 //!
-//! [`Manifest`] describes the template root, configure candidates, and optional Luau module.
-//! [`ManifestCandidate::resolve`] expands candidate paths and globs. [`Candidate::combine`]
-//! applies each discovered file to the profile data using its declared [`MergePolicy`].
+//! See [`Manifest`] for the available settings and [`MergePolicy`] for combining input files.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -24,12 +22,12 @@ pub type DefaultFormat = Toml;
 
 /// The default filename extension used to discover template candidates.
 ///
-/// Template discovery and event filtering use [`ManifestConfigure::template_extension`] when set.
+/// Override with [`ManifestConfigure::template_extension`].
 pub const DEFAULT_TEMPLATE_EXTENSION: &str = "jinja";
 
 /// The default quiet interval in milliseconds before rendering after an input change.
 ///
-/// Each relevant input event restarts the wait. See [`ManifestConfigure::notificate_period`].
+/// Override with [`ManifestConfigure::notificate_period`].
 pub const DEFAULT_NOTIFICATE_PERIOD: u64 = 50;
 
 /// The manifest of a Mirage-managed directory.
@@ -85,7 +83,7 @@ pub struct ManifestConfigure {
 
 /// The handling of undefined references during a render.
 ///
-/// Selects [`minijinja::UndefinedBehavior`]. The default is [`Self::Strict`].
+/// Defaults to [`Self::Strict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UndefinedKind {
@@ -113,21 +111,21 @@ pub struct ManifestModule {
 
 /// A merge policy for individual configure candidates.
 ///
-/// Each variant selects a [`Figment`] operation. Tables merge recursively in every policy.
+/// Tables merge recursively in every policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MergePolicy {
-    /// Replace conflicting scalar values and arrays through [`Figment::merge`].
+    /// Replace conflicting scalar values and arrays.
     #[default]
     Override,
 
-    /// Replace conflicting scalars and concatenate arrays through [`Figment::admerge`].
+    /// Replace conflicting scalars and concatenate arrays.
     Append,
 
-    /// Keep existing values and fill missing keys through [`Figment::join`].
+    /// Keep existing values and fill missing keys.
     Fallback,
 
-    /// Keep existing values and concatenate arrays through [`Figment::adjoin`].
+    /// Keep existing values and concatenate arrays.
     Supplement,
 }
 
@@ -136,7 +134,7 @@ pub enum MergePolicy {
 pub struct ManifestCandidate {
     /// The candidate path.
     ///
-    /// Shell expansion and glob matching occur in [`Self::resolve`].
+    /// Accepts shell expressions and glob patterns. See [`Self::resolve`].
     pub path: String,
 
     /// The merge policy for this candidate.
@@ -194,7 +192,7 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// Apply the target merge policy to the provided file for the [`Figment`] state.
+    /// Combine this file's data with the supplied configuration using its merge policy.
     #[inline]
     #[must_use]
     pub fn combine<F>(&self, target_value: Figment) -> Figment

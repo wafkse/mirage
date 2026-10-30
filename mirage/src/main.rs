@@ -60,7 +60,7 @@ impl Application {
             .init();
     }
 
-    /// Run the daemon on a multithreaded Tokio runtime until termination.
+    /// Run the daemon until termination.
     fn daemon(target_settings: MirageCli) -> eyre::Result<()> {
         let target_runtime = tokio::runtime::Runtime::new()?;
 

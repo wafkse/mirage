@@ -1,7 +1,6 @@
-//! Candidate loading and publication of the active render context.
+//! Configuration inputs and profile selection.
 //!
-//! [`ConfigureState`] watches the configure tree and selected profile. Relevant events rebuild
-//! the context through `ConfigureState::fold` and publish it through [`ConfigurePipe`].
+//! See [`ConfigureState`] and [`ConfigurePipe`] for additional information.
 
 use std::{
     ops::Deref,
@@ -26,7 +25,7 @@ use crate::{
 pub struct ConfigurePipe(pub watch::Sender<toml::Value>, pub watch::Sender<Profile>);
 
 impl ConfigurePipe {
-    /// Determine the send half for the render context.
+    /// Access the sender for render-context updates.
     #[inline]
     #[must_use]
     pub const fn context(&self) -> &watch::Sender<toml::Value> {
@@ -35,7 +34,7 @@ impl ConfigurePipe {
         target_value
     }
 
-    /// Determine the send half for the render context, mutably.
+    /// Mutably access the sender for render-context updates.
     #[inline]
     pub const fn context_mut(&mut self) -> &mut watch::Sender<toml::Value> {
         let Self(target_value, ..) = self;
@@ -43,7 +42,7 @@ impl ConfigurePipe {
         target_value
     }
 
-    /// Determine the send half for the selected profile.
+    /// Access the sender for profile changes.
     #[inline]
     #[must_use]
     pub const fn profile(&self) -> &watch::Sender<Profile> {
@@ -52,7 +51,7 @@ impl ConfigurePipe {
         target_value
     }
 
-    /// Determine the send half for the selected profile, mutably.
+    /// Mutably access the sender for profile changes.
     #[inline]
     pub const fn profile_mut(&mut self) -> &mut watch::Sender<Profile> {
         let Self(.., target_value) = self;
@@ -63,8 +62,8 @@ impl ConfigurePipe {
 
 /// Watch configure inputs and publish the selected profile's resolved context.
 ///
-/// Matching file events and profile changes rebuild the context from the retained manifest
-/// patterns. Each rebuild discovers the current files and replaces the published context.
+/// File and profile changes replace the current context, including any transient mutations.
+/// Candidate patterns are matched again so newly added files can contribute values.
 // NOTE(invariant): None.
 #[derive(Debug)]
 pub struct ConfigureState {
@@ -88,7 +87,7 @@ impl ConfigureState {
     ///
     /// # Errors
     ///
-    /// Returns an error when the candidate tree cannot be watched or the initial context fails to fold.
+    /// Returns an error when the candidate tree cannot be watched or the initial configuration cannot be loaded.
     #[inline]
     pub fn new(
         (candidate_tree, manifest_candidates): (&Path, Vec<ManifestCandidate>),
@@ -120,7 +119,7 @@ impl ConfigureState {
         })
     }
 
-    /// Determine the watched pipe pair.
+    /// Access the context and profile update channels.
     #[inline]
     #[must_use]
     pub const fn pipe(&self) -> &ConfigurePipe {
@@ -129,7 +128,7 @@ impl ConfigureState {
         configure_pipe
     }
 
-    /// Determine the watched pipe pair, mutably.
+    /// Mutably access the context and profile update channels.
     #[inline]
     pub const fn pipe_mut(&mut self) -> &mut ConfigurePipe {
         let Self { configure_pipe, .. } = self;
@@ -140,7 +139,7 @@ impl ConfigureState {
     /// Combine configure candidates and select the active profile's render context.
     ///
     /// Expand candidate patterns in manifest order, apply their merge policies, and overlay `MIRAGE_`
-    /// environment values. Both daemon execution and one-shot rendering use this operation.
+    /// environment values.
     ///
     /// # Errors
     ///
@@ -181,6 +180,7 @@ impl ConfigureState {
 impl Background for ConfigureState {
     type Output = ();
 
+    #[inline]
     async fn run(self) -> eyre::Result<Self::Output> {
         /// Input changes handled by [`ConfigureState`].
         #[derive(Debug)]

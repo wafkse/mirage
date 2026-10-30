@@ -7,6 +7,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+mirage = { version = "*", path = "mirage" }
+
 bytes = { version = "1.11", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 eyre = "0.6"
@@ -16,12 +18,12 @@ glob = "0.3"
 minijinja = { version = "2.21", features = ["json", "loader"] }
 mlua = { version = "0.11", features = ["async", "luau", "luau-jit", "send"] }
 notify = "8.2"
+pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shellexpand = "3.1"
 tempfile = "3.27"
-tokio = {
-  version = "1",
+tokio = { version = "1.54.1",
   features = [
     "fs",
     "io-util",
@@ -33,11 +35,16 @@ tokio = {
     "sync",
     "time",
     "tracing"
-  ]
-}
+  ] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
 toml = "1.1"
 toml_edit = { version = "0.25", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
+
+[workspace.lints.clippy]
+missing_const_for_fn = "deny"
+missing_inline_in_public_items = "deny"
+mod_module_files = "deny"
+missing_docs_in_private_items = "deny"
